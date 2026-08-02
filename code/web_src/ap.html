@@ -53,7 +53,7 @@ fetch('/wifiscan?_='+Date.now(),{cache:'no-store'}).then(function(r){return r.js
 var s=$('sel');
 if(!a||!a.length){clearSel('未发现 WiFi');return}
 a.sort(function(x,y){return y.rssi-x.rssi});
-var o=document.createElement('option');o.value='';o.textContent='共 '+a.length+' 个，请选择';s.appendChild(o);
+var o=document.createElement('option');o.value='';o.textContent='共 '+a.length+' 个，请选择';
 s.replaceChildren(o);
 a.forEach(function(w){var e=document.createElement('option');e.value=w.ssid;e.textContent=(w.ssid||'(隐藏网络)')+' · '+w.rssi+'dBm'+(w.enc?' · 加密':' · 开放');s.appendChild(e)});
 }).catch(function(){clearSel('扫描失败，请重试')}).finally(function(){b.disabled=false;b.textContent='扫描'});

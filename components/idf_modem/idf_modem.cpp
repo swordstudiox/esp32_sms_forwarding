@@ -20,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "idf_log.h"
+#include "idf_util.h"
 #include "nvs.h"
 
 static const char* TAG = "idf_modem";
@@ -61,17 +62,12 @@ static std::atomic<int> s_reset_request{0};  // 1=AT软重启，2=EN硬重启；
 static bool s_data_mode_retry_pending = false;
 static uint8_t s_data_mode_retry_count = 0;
 static TickType_t s_next_data_mode_retry = 0;
-static int s_logged_csq = -1;
-static int s_logged_ber = -1;
-static int s_logged_rsrp = 999;
-static int s_logged_rsrq = 999;
-static int s_logged_sinr = 999;
-static bool s_logged_detail_valid = false;
 static std::atomic<int> s_logged_sms_storage_code{-1};  // -1=未知，0=MT，1=ME，2=SM
 static bool s_identity_static_attempted = false;
 static bool s_identity_network_attempted = false;
 static std::atomic<int64_t> s_last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
 static std::atomic<uint32_t> s_status_sample_requests{0};
+static std::atomic<uint32_t> s_esim_operation_depth{0};
 
 void idf_modem_signal_event(void);
 
@@ -96,18 +92,9 @@ static void cleanup_start_resources()
     s_urc_buffer.clear();
 }
 
-static std::string trim(std::string value)
-{
-    size_t start = 0;
-    while (start < value.size() && isspace(static_cast<unsigned char>(value[start]))) ++start;
-    size_t end = value.size();
-    while (end > start && isspace(static_cast<unsigned char>(value[end - 1]))) --end;
-    return value.substr(start, end - start);
-}
-
 static bool parse_long_token(const std::string& value, long& out)
 {
-    std::string text = trim(value);
+    std::string text = idf_util_trim_copy(value);
     if (text.empty()) return false;
     errno = 0;
     char* end = nullptr;
@@ -126,7 +113,7 @@ static bool parse_comma_longs(const std::string& text, long* values, int max_val
     while (start < text.size() && count < max_values) {
         size_t comma = text.find(',', start);
         std::string part = text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-        part = trim(part);
+        part = idf_util_trim_copy(part);
         long value = 0;
         if (part.empty() || !parse_long_token(part, value)) return false;
         values[count++] = value;
@@ -154,7 +141,7 @@ static int at_final_result(const std::string& resp)
     while (pos < resp.size()) {
         size_t end = resp.find_first_of("\r\n", pos);
         if (end == std::string::npos) end = resp.size();
-        std::string line = trim(resp.substr(pos, end - pos));
+        std::string line = idf_util_trim_copy(resp.substr(pos, end - pos));
         if (line == "OK") return 1;
         if (line == "ERROR" || line.rfind("+CMS ERROR", 0) == 0 ||
             line.rfind("+CME ERROR", 0) == 0) return -1;
@@ -203,7 +190,7 @@ static std::string first_payload_line(const std::string& resp, const char* cmd =
     while (pos < resp.size()) {
         size_t end = resp.find('\n', pos);
         if (end == std::string::npos) end = resp.size();
-        std::string line = trim(resp.substr(pos, end - pos));
+        std::string line = idf_util_trim_copy(resp.substr(pos, end - pos));
         if (line_is_payload(line, cmd)) return line;
         pos = end + 1;
     }
@@ -216,7 +203,7 @@ static std::string first_digits_line(const std::string& resp, size_t min_len, si
     while (pos < resp.size()) {
         size_t end = resp.find('\n', pos);
         if (end == std::string::npos) end = resp.size();
-        std::string line = trim(resp.substr(pos, end - pos));
+        std::string line = idf_util_trim_copy(resp.substr(pos, end - pos));
         bool digits = !line.empty();
         for (char ch : line) digits = digits && isdigit(static_cast<unsigned char>(ch));
         if (digits && line.size() >= min_len && line.size() <= max_len) return line;
@@ -475,17 +462,18 @@ static void capture_pending_uart_locked(uint32_t max_ms)
 static bool poll_unsolicited_uart(uint32_t max_ms)
 {
     if (!s_at_mutex) return false;
-    if (xSemaphoreTake(s_at_mutex, 0) != pdTRUE) return false;
+    if (xSemaphoreTakeRecursive(s_at_mutex, 0) != pdTRUE) return false;
     capture_pending_uart_locked(max_ms);
-    xSemaphoreGive(s_at_mutex);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return true;
 }
 
 static bool at_channel_idle_now(void)
 {
+    if (idf_modem_esim_operation_active()) return false;
     if (!s_at_mutex) return false;
-    if (xSemaphoreTake(s_at_mutex, 0) != pdTRUE) return false;
-    xSemaphoreGive(s_at_mutex);
+    if (xSemaphoreTakeRecursive(s_at_mutex, 0) != pdTRUE) return false;
+    xSemaphoreGiveRecursive(s_at_mutex);
     return true;
 }
 
@@ -501,10 +489,21 @@ static void append_capped(std::string& out, const uint8_t* data, size_t len, siz
     out.append(reinterpret_cast<const char*>(data), len);
 }
 
+static void preserve_sms_urc_from_response(const std::string& response)
+{
+    if (response.find("+CMT:") != std::string::npos ||
+        response.find("+CMTI:") != std::string::npos ||
+        response.find("+CLIP:") != std::string::npos ||
+        response.find("RING") != std::string::npos) {
+        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
+        append_urc_text(response);
+    }
+}
+
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
 {
     if (!s_started) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
 
     capture_pending_uart_locked(30);
     std::string wire = cmd;
@@ -534,21 +533,15 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
             if (scan.size() > 32) scan.erase(0, scan.size() - 32);
         }
     }
-    if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos ||
-        response.find("+CLIP:") != std::string::npos ||
-        response.find("RING") != std::string::npos) {
-        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
-        append_urc_text(response);
-    }
-    xSemaphoreGive(s_at_mutex);
+    preserve_sms_urc_from_response(response);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
 
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response)
 {
     if (!s_started || !token || !*token) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
 
     capture_pending_uart_locked(30);
     std::string wire = cmd;
@@ -578,21 +571,15 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
             if (scan.size() > 64) scan.erase(0, scan.size() - 64);
         }
     }
-    if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos ||
-        response.find("+CLIP:") != std::string::npos ||
-        response.find("RING") != std::string::npos) {
-        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
-        append_urc_text(response);
-    }
-    xSemaphoreGive(s_at_mutex);
+    preserve_sms_urc_from_response(response);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
 
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response)
 {
     if (!s_started || !pdu) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
 
     capture_pending_uart_locked(30);
     std::string wire = cmgs_cmd;
@@ -656,14 +643,8 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
         }
     }
 
-    if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos ||
-        response.find("+CLIP:") != std::string::npos ||
-        response.find("RING") != std::string::npos) {
-        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
-        append_urc_text(response);
-    }
-    xSemaphoreGive(s_at_mutex);
+    preserve_sms_urc_from_response(response);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
 
@@ -692,13 +673,6 @@ static bool parse_csq(const std::string& resp, int& csq, int& ber)
     return true;
 }
 
-static const char* format_ber(int ber, char* buf, size_t len)
-{
-    if (ber >= 99) return "未知";
-    snprintf(buf, len, "%d", ber);
-    return buf;
-}
-
 static bool parse_cereg(const std::string& resp, int& stat)
 {
     size_t p = resp.find("+CEREG:");
@@ -708,14 +682,14 @@ static bool parse_cereg(const std::string& resp, int& stat)
     if (!token) return false;
     std::string rest = token + strlen("+CEREG:");
     size_t comma = rest.find(',');
-    std::string first = trim(rest.substr(0, comma));
+    std::string first = idf_util_trim_copy(rest.substr(0, comma));
     long first_value = -1;
     if (!parse_long_token(first, first_value)) return false;
 
     long status_value = first_value;
     if (comma != std::string::npos) {
         size_t second_end = rest.find(',', comma + 1);
-        std::string second = trim(rest.substr(
+        std::string second = idf_util_trim_copy(rest.substr(
             comma + 1, second_end == std::string::npos ? std::string::npos : second_end - comma - 1));
         long second_value = -1;
         // 查询响应是 +CEREG: <n>,<stat>；URC 是 +CEREG: <stat>[,<tac>,...]，
@@ -825,6 +799,76 @@ static std::string parse_cnum_phone(const std::string& resp)
     return normalize_msisdn(phone);
 }
 
+static bool phone_number_valid_for_at(const std::string& phone)
+{
+    if (phone.size() < 3 || phone.size() > 20) return false;
+    size_t digits = 0;
+    for (size_t i = 0; i < phone.size(); ++i) {
+        char ch = phone[i];
+        if (i == 0 && ch == '+') continue;
+        if (!isdigit(static_cast<unsigned char>(ch))) return false;
+        ++digits;
+    }
+    return digits >= 3;
+}
+
+static bool phonebook_storage_name_valid(const std::string& storage)
+{
+    if (storage.empty() || storage.size() > 12) return false;
+    for (char ch : storage) {
+        if (!isalnum(static_cast<unsigned char>(ch))) return false;
+    }
+    return true;
+}
+
+static std::string parse_cpbs_selected(const std::string& resp)
+{
+    size_t p = resp.find("+CPBS:");
+    if (p == std::string::npos) return {};
+    return first_quoted(line_containing(resp, p));
+}
+
+static std::string parse_cpbr_phone(const std::string& resp)
+{
+    size_t pos = 0;
+    while (true) {
+        size_t p = resp.find("+CPBR:", pos);
+        if (p == std::string::npos) return {};
+        std::string phone = normalize_msisdn(first_quoted(line_containing(resp, p)));
+        if (phone_number_valid_for_at(phone)) return phone;
+        pos = p + strlen("+CPBR:");
+    }
+}
+
+static void restore_phonebook_storage(const std::string& storage)
+{
+    if (!phonebook_storage_name_valid(storage)) return;
+    std::string cmd = "AT+CPBS=\"";
+    cmd += storage;
+    cmd += "\"";
+    std::string ignored;
+    send_ok(cmd.c_str(), 1500, &ignored);
+}
+
+static std::string read_own_number_phonebook()
+{
+    std::string resp;
+    if (!send_ok("AT+CPBS?", 1500, &resp)) return {};
+    std::string original = parse_cpbs_selected(resp);
+    if (!phonebook_storage_name_valid(original)) return {};
+
+    if (!send_ok(R"(AT+CPBS="ON")", 1500, &resp)) {
+        restore_phonebook_storage(original);
+        return {};
+    }
+    std::string phone;
+    if (send_ok("AT+CPBR=1,3", 2000, &resp)) {
+        phone = parse_cpbr_phone(resp);
+    }
+    restore_phonebook_storage(original);
+    return phone;
+}
+
 static bool starts_with(const std::string& text, const char* prefix)
 {
     return text.rfind(prefix, 0) == 0;
@@ -851,7 +895,7 @@ static std::string hex_encode_ascii(const std::string& text)
 static bool parse_http_url(const std::string& raw_url, std::string& protocol,
                            std::string& host, std::string& path, std::string& error)
 {
-    std::string url = trim(raw_url);
+    std::string url = idf_util_trim_copy(raw_url);
     if (url.empty()) url = IDF_KEEPALIVE_DEFAULT_URL;
     if (url.size() > 240) {
         error = "蜂窝HTTP URL过长";
@@ -883,7 +927,7 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
     }
     size_t hash = path.find('#');
     if (hash != std::string::npos) path.resize(hash);
-    host = trim(host);
+    host = idf_util_trim_copy(host);
     if (host.empty() || host.find('"') != std::string::npos ||
         host.find(' ') != std::string::npos || path.find('"') != std::string::npos ||
         path.find(' ') != std::string::npos) {
@@ -909,17 +953,6 @@ static void append_no_cache_query(std::string& path)
              static_cast<unsigned long long>(esp_timer_get_time() / 1000ULL),
              static_cast<unsigned>(esp_random()));
     path += buf;
-}
-
-static void preserve_sms_urc_from_response(const std::string& response)
-{
-    if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos ||
-        response.find("+CLIP:") != std::string::npos ||
-        response.find("RING") != std::string::npos) {
-        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
-        append_urc_text(response);
-    }
 }
 
 static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
@@ -1065,7 +1098,7 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
                 continue;
             }
             if (ch == '\r' || ch == '\n') {
-                std::string line = trim(head);
+                std::string line = idf_util_trim_copy(head);
                 if (!line.empty()) {
                     if (starts_with(line, "+MHTTPURC: \"err\"")) {
                         parse_mhttp_head(line, http_id, result, complete, error);
@@ -1128,7 +1161,7 @@ static bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
     size_t eol = resp.find('\n', p);
     if (eol == std::string::npos) eol = resp.size();
     if (comma == std::string::npos || comma >= eol) return false;
-    ip = trim(resp.substr(comma + 1, eol - comma - 1));
+    ip = idf_util_trim_copy(resp.substr(comma + 1, eol - comma - 1));
     ip.erase(std::remove(ip.begin(), ip.end(), '"'), ip.end());
     if (!valid_ipv4_address(ip)) return false;
     return true;
@@ -1185,7 +1218,7 @@ static bool parse_muestats_cell(const std::string& resp, IdfModemStatus& patch)
     while (pos <= line.size() && count < 12) {
         size_t comma = line.find(',', pos);
         if (comma == std::string::npos) comma = line.size();
-        parts[count++] = trim(line.substr(pos, comma - pos));
+        parts[count++] = idf_util_trim_copy(line.substr(pos, comma - pos));
         if (comma == line.size()) break;
         pos = comma + 1;
     }
@@ -1259,23 +1292,6 @@ static void sample_signal_detail_once(void)
     if (next_rsrp == 999 && next_rsrq == 999 && next_sinr == 999) return;
 
     update_status(patch, false, true);
-
-    bool first = !s_logged_detail_valid;
-    bool duplicate = s_logged_detail_valid &&
-                     next_rsrp == s_logged_rsrp &&
-                     next_rsrq == s_logged_rsrq &&
-                     next_sinr == s_logged_sinr;
-    bool changed = !duplicate &&
-                   (first ||
-                    (next_rsrp != 999 && (s_logged_rsrp == 999 || abs(next_rsrp - s_logged_rsrp) >= 6)) ||
-                    (next_rsrq != 999 && (s_logged_rsrq == 999 || abs(next_rsrq - s_logged_rsrq) >= 4)) ||
-                    (next_sinr != 999 && (s_logged_sinr == 999 || abs(next_sinr - s_logged_sinr) >= 6)));
-    if (changed) {
-        s_logged_detail_valid = true;
-        s_logged_rsrp = next_rsrp;
-        s_logged_rsrq = next_rsrq;
-        s_logged_sinr = next_sinr;
-    }
 }
 
 static bool model_skips_cgact(void)
@@ -1297,7 +1313,7 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
                                             uint32_t inactive_timeout_ms)
 {
     std::string resp;
-    std::string apn = trim(cfg.apn);
+    std::string apn = idf_util_trim_copy(cfg.apn);
     // 数据漫游策略：未勾选"允许数据漫游"且当前处于漫游(CEREG=5)时不激活蜂窝数据。
     // 启动阶段注册状态未知(stat=-1)会乐观激活，注册完成后由 enforce_roaming_data_policy 兜底关闭。
     bool want_data = cfg.dataEnabled &&
@@ -1386,6 +1402,14 @@ static void apply_operator_if_configured(const IdfSimSettingsView& cfg)
     esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
     idf_logf("运营商: 锁定 PLMN %s %s", cfg.operatorPlmn.c_str(),
              err == ESP_OK ? "成功" : "失败(可能不可达)");
+}
+
+static void restore_auto_operator_before_registration(const IdfSimSettingsView& cfg)
+{
+    if (!cfg.operatorPlmn.empty()) return;
+    std::string resp;
+    esp_err_t err = idf_modem_send_at("AT+COPS=0", 30000, resp);
+    idf_logf("运营商: 自动注册(COPS=0) %s", err == ESP_OK ? "成功" : "失败(可能不可达)");
 }
 
 static bool process_data_mode_retry(void)
@@ -1499,7 +1523,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
     normalize_keepalive_payload_size(host, path);
     append_no_cache_query(path);
 
-    if (xSemaphoreTake(s_at_mutex, pdMS_TO_TICKS(CELLULAR_HTTP_TIMEOUT_MS + 45000UL)) != pdTRUE) {
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(CELLULAR_HTTP_TIMEOUT_MS + 45000UL)) != pdTRUE) {
         result.message = "模组串口忙，蜂窝HTTP未执行";
         return ESP_ERR_TIMEOUT;
     }
@@ -1508,7 +1532,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
              protocol.c_str(), host.c_str(), path.c_str());
 
     std::string resp;
-    std::string apn = trim(config.apn);
+    std::string apn = idf_util_trim_copy(config.apn);
     if (!apn.empty() && apn.find('"') == std::string::npos) {
         std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
         cmd += apn;
@@ -1530,7 +1554,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
             idf_log_line("关闭PDP上下文(CGACT=0)...");
             send_at_locked("AT+CGACT=0,1", 5000, resp);
         }
-        xSemaphoreGive(s_at_mutex);
+        xSemaphoreGiveRecursive(s_at_mutex);
         result.message = "蜂窝PDP未取得有效IP，请查看日志";
         return ESP_FAIL;
     }
@@ -1555,7 +1579,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
         result.message = ok ? "蜂窝HTTP payload 下载完成" : "蜂窝HTTP payload 下载失败，请查看日志";
     }
     result.ok = ok;
-    xSemaphoreGive(s_at_mutex);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return ok ? ESP_OK : ESP_FAIL;
 }
 
@@ -1570,16 +1594,6 @@ static void sample_signal_once(void)
     patch.csq = csq;
     patch.ber = ber;
     update_status(patch, false, true);
-    bool first = s_logged_csq < 0;
-    bool changed = first || abs(csq - s_logged_csq) >= 3 || ber != s_logged_ber ||
-                   csq == 99 || s_logged_csq == 99;
-    if (changed) {
-        s_logged_csq = csq;
-        s_logged_ber = ber;
-        char ber_buf[16];
-        const char* ber_text = format_ber(ber, ber_buf, sizeof(ber_buf));
-        ESP_LOGD(TAG, "%s CSQ=%d/31 BER=%s", first ? "signal" : "signal changed", csq, ber_text);
-    }
 }
 
 static bool sample_identity_once(bool log_summary = false, bool include_network_fields = true)
@@ -1622,7 +1636,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     auto parse_iccid_response = [](const std::string& raw) {
         std::string line = first_payload_line(raw);
         size_t p = line.find(':');
-        std::string value = trim(p == std::string::npos ? line : line.substr(p + 1));
+        std::string value = idf_util_trim_copy(p == std::string::npos ? line : line.substr(p + 1));
         value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
         for (char& ch : value) {
             if (ch == 'f') ch = 'F';
@@ -1663,6 +1677,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
         }
         if (before.phone.empty()) {
             if (send_ok("AT+CNUM", 1500, &resp)) patch.phone = parse_cnum_phone(resp);
+            if (patch.phone.empty()) patch.phone = read_own_number_phonebook();
         }
     }
 
@@ -1951,6 +1966,9 @@ static bool s_reinit_pending = false;
 
 static bool handle_reset_request_if_any(void)
 {
+    // 逻辑通道尚未关闭时重启会把 eSIM 操作截断；切卡成功后 idf_esim 请求的软重启
+    // 会等到 APDU 会话结束(深度归零)才执行。
+    if (s_esim_operation_depth.load(std::memory_order_relaxed) != 0) return false;
     int request = s_reset_request.exchange(0, std::memory_order_relaxed);
     if (request == 0) return false;
 
@@ -1982,8 +2000,9 @@ static bool handle_reset_request_if_any(void)
     patch.phase = "at_ready";
     update_status(patch);
     configure_sms_and_registration();
-    set_phase("registering");
     apply_startup_data_mode();
+    set_phase("registering");
+    restore_auto_operator_before_registration(idf_config_get_sim_settings_view());
     s_reinit_pending = false;
     return true;
 }
@@ -2002,8 +2021,9 @@ static void run_pending_reinit_if_recovered(void)
     patch.phase = "at_ready";
     update_status(patch);
     configure_sms_and_registration();
-    set_phase("registering");
     apply_startup_data_mode();
+    set_phase("registering");
+    restore_auto_operator_before_registration(idf_config_get_sim_settings_view());
     s_reinit_pending = false;
 }
 
@@ -2067,8 +2087,9 @@ static void modem_task(void*)
 
     configure_sms_and_registration();
 
-    set_phase("registering");
     apply_startup_data_mode();
+    set_phase("registering");
+    restore_auto_operator_before_registration(idf_config_get_sim_settings_view());
 
     int check_count = 0;
     int stat = -1;
@@ -2230,7 +2251,8 @@ static void modem_task(void*)
         // SIM 热插拔检测：低频轮询 AT+CPIN?，识别运行中插卡/拔卡。
         // 插入(无卡→有卡)：自动硬重启模组 + 作废旧身份，让新卡从干净状态初始化；
         // 拔出(有卡→无卡)：标记未就绪并清空身份，避免概览沿用旧卡信息。
-        if (esp_timer_get_time() >= sim_check_not_before_us &&
+        int64_t sim_check_now_us = esp_timer_get_time();
+        if (sim_check_now_us >= sim_check_not_before_us &&
             (last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
             at_channel_idle_now()) {
             last_sim_check = now;
@@ -2290,7 +2312,8 @@ esp_err_t idf_modem_start(const IdfConfig& config)
 {
     if (s_started) return ESP_OK;
     cleanup_start_resources();
-    s_at_mutex = xSemaphoreCreateMutex();
+    // eSIM 需跨多条 CCHO/CGLA/CCHC 独占 AT 通道，同任务内的单条 AT 再递归取锁。
+    s_at_mutex = xSemaphoreCreateRecursiveMutex();
     s_status_mutex = xSemaphoreCreateMutex();
     s_urc_mutex = xSemaphoreCreateMutex();
     if (!s_event_sem) s_event_sem = xSemaphoreCreateBinary();
@@ -2359,6 +2382,84 @@ IdfModemStatus idf_modem_get_status(void)
     return copy;
 }
 
+esp_err_t idf_modem_write_own_number(const std::string& phone_raw, std::string& message)
+{
+    message.clear();
+    std::string phone = normalize_msisdn(phone_raw);
+    if (!phone_number_valid_for_at(phone)) {
+        message = "本机号码无效（3-20 位数字，可带 + 前缀）";
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_started || !s_at_mutex) {
+        message = "模组尚未启动";
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        message = "模组 AT 通道忙，请稍后重试";
+        return ESP_ERR_TIMEOUT;
+    }
+
+    std::string resp;
+    std::string original_storage;
+    bool restore_needed = false;
+    std::string verified_phone;
+    esp_err_t err = send_at_locked("AT+CPBS?", 1500, resp);
+    if (err == ESP_OK) original_storage = parse_cpbs_selected(resp);
+
+    do {
+        err = send_at_locked(R"(AT+CPBS="ON")", 2000, resp);
+        if (err != ESP_OK) {
+            message = resp.empty() ? "模组不支持 SIM Own Number 电话本" : ("选择 SIM Own Number 电话本失败: " + resp);
+            break;
+        }
+        restore_needed = true;
+        if (!phonebook_storage_name_valid(original_storage)) original_storage = "SM";
+
+        int type = phone.rfind("+", 0) == 0 ? 145 : 129;
+        std::string cmd = "AT+CPBW=1,";
+        cmd += "\"";
+        cmd += phone;
+        cmd += "\",";
+        cmd += std::to_string(type);
+        cmd += ",\"\"";
+        err = send_at_locked(cmd, 3000, resp);
+        if (err != ESP_OK) {
+            message = resp.empty() ? "写入 SIM 本机号码失败" : ("写入 SIM 本机号码失败: " + resp);
+            break;
+        }
+
+        err = send_at_locked("AT+CPBR=1,3", 2000, resp);
+        verified_phone = (err == ESP_OK) ? parse_cpbr_phone(resp) : std::string();
+        if (verified_phone.empty()) {
+            message = "SIM 本机号码已写入，但电话本读回为空";
+            err = ESP_FAIL;
+            break;
+        }
+
+        err = send_at_locked("AT+CNUM", 2000, resp);
+        std::string cnum_phone = (err == ESP_OK) ? parse_cnum_phone(resp) : std::string();
+        if (cnum_phone.empty()) {
+            message = "SIM 本机号码已写入，但 CNUM 暂未返回，请重启模组后重试";
+            err = ESP_FAIL;
+            break;
+        }
+        verified_phone = cnum_phone;
+    } while (false);
+
+    if (restore_needed) restore_phonebook_storage(original_storage);
+    xSemaphoreGiveRecursive(s_at_mutex);
+
+    if (err == ESP_OK) {
+        IdfModemStatus patch;
+        patch.phone = verified_phone;
+        update_status(patch, true, false);
+        message = "SIM 本机号码已写入: " + verified_phone;
+    } else if (message.empty()) {
+        message = resp.empty() ? esp_err_to_name(err) : resp;
+    }
+    return err;
+}
+
 esp_err_t idf_modem_request_reset(bool hard_reset)
 {
     if (!s_started) return ESP_ERR_INVALID_STATE;
@@ -2376,6 +2477,23 @@ void idf_modem_request_status_sample(void)
 {
     s_last_web_poll_us.store(esp_timer_get_time(), std::memory_order_relaxed);
     s_status_sample_requests.fetch_add(1, std::memory_order_relaxed);
+}
+
+void idf_modem_begin_esim_operation(void)
+{
+    s_esim_operation_depth.fetch_add(1, std::memory_order_relaxed);
+    if (s_at_mutex) xSemaphoreTakeRecursive(s_at_mutex, portMAX_DELAY);
+}
+
+void idf_modem_end_esim_operation(void)
+{
+    if (s_at_mutex) xSemaphoreGiveRecursive(s_at_mutex);
+    s_esim_operation_depth.fetch_sub(1, std::memory_order_relaxed);
+}
+
+bool idf_modem_esim_operation_active(void)
+{
+    return s_esim_operation_depth.load(std::memory_order_relaxed) != 0;
 }
 
 static std::atomic<void (*)(void)> s_sim_identity_hook{nullptr};

@@ -726,6 +726,24 @@
       }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;});
     }
 
+    // ---- SIM Own Number ----
+    function writeOwnNumber(){
+      var input=document.querySelector('[name="phoneNumber"]');
+      var r=document.getElementById('writeOwnNumberResult');
+      if(!input||!r)return;
+      var phone=(input.value||'').trim();
+      if(!phone){r.className='result-box result-error';r.textContent='请先填写本机号码';return;}
+      r.className='result-box result-loading';r.textContent='正在写入 SIM Own Number 电话本...';
+      csrfFetch('/modem?action=write_own_number&phone='+encodeURIComponent(phone),{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
+        r.className='result-box '+(d.success?'result-success':'result-error');
+        r.textContent=d.message|| (d.success?'写入成功':'写入失败');
+        if(d.success){
+          ensureConfig(true).catch(function(){ return null; });
+          if(panelActive('overview')) loadStatus(true);
+        }
+      }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;});
+    }
+
     // ---- Flight Mode ----
     function queryFlightMode(){
       var r=document.getElementById('flightResult');
@@ -781,7 +799,7 @@
     }
 
     // ---- AT Terminal ----
-    function atTime(){var d=new Date(),p=function(n){return('0'+n).slice(-2)};return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());}
+    function atTime(){var d=new Date();return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(11,19);}
     function addLog(msg,type){
       type=type||'resp';var log=document.getElementById('atLog'),div=document.createElement('div'),b=document.createElement('b');
       if(!log)return;
@@ -1312,20 +1330,16 @@
     var apHandled = false;  // 配网模式只自动跳转一次
     function fmtEpoch(ep) {
       if (!ep) return '(无)';
-      var d = new Date((ep + devTz * 60) * 1000), p = function(n){ return ('0' + n).slice(-2); };
-      return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
+      return new Date((ep + devTz * 60) * 1000).toISOString().slice(0, 16).replace('T', ' ');
     }
     // 详情抽屉里用到秒的完整时间
     function fmtEpochFull(ep) {
       if (!ep) return '(无)';
-      var d = new Date((ep + devTz * 60) * 1000), p = function(n){ return ('0' + n).slice(-2); };
-      return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' +
-             p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds());
+      return new Date((ep + devTz * 60) * 1000).toISOString().slice(0, 19).replace('T', ' ');
     }
     function fmtClockEpoch(ep) {
       if (!ep) return '--';
-      var d = new Date((ep + devTz * 60) * 1000), p = function(n){ return ('0' + n).slice(-2); };
-      return p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds());
+      return new Date((ep + devTz * 60) * 1000).toISOString().slice(11, 19);
     }
     function fmtRsrp(r) { if (r == null || r >= 0 || r < -200) return '--'; return r + ' dBm'; }
     function fmtBer(b) { return (b == null || b >= 99) ? '99 (未知)' : String(b); }

@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "idf_util.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -284,33 +285,12 @@ static std::string truncate_body(const char* text)
     return out;
 }
 
-static void json_escape_append(std::string& out, const std::string& value)
-{
-    for (char ch : value) {
-        switch (ch) {
-            case '\\': out += "\\\\"; break;
-            case '"': out += "\\\""; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(ch) < 0x20) {
-                    char buf[7];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
-                    out += buf;
-                } else {
-                    out += ch;
-                }
-        }
-    }
-}
-
 static void json_prop(std::string& out, const char* key, const std::string& value)
 {
     out += "\"";
     out += key;
     out += "\":\"";
-    json_escape_append(out, value);
+    idf_util_json_escape_append(out, value);
     out += "\"";
 }
 
@@ -385,31 +365,6 @@ size_t idf_inbox_count(void)
     return count;
 }
 
-bool idf_inbox_get_newest(size_t index, IdfInboxEntry& out)
-{
-    ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
-    size_t seen = 0;
-    bool ok = false;
-    for (size_t k = 0; k < s_inbox_filled; ++k) {
-        size_t idx = (s_inbox_head + INBOX_MAX - 1 - k) % INBOX_MAX;
-        if (s_inbox[idx].deleted) continue;
-        if (seen == index) {
-            out.id = s_inbox[idx].id;
-            out.recvEpoch = s_inbox[idx].recvEpoch;
-            out.sender = s_inbox[idx].sender;
-            out.ts = s_inbox[idx].ts;
-            out.text = s_inbox[idx].text;
-            out.forwarded = s_inbox[idx].forwarded;
-            ok = true;
-            break;
-        }
-        ++seen;
-    }
-    xSemaphoreGive(s_mutex);
-    return ok;
-}
-
 bool idf_inbox_get_by_id(uint32_t id, IdfInboxEntry& out)
 {
     if (id == 0) return false;
@@ -471,29 +426,6 @@ void idf_sent_add(const char* target, const char* text, bool ok)
     if (evict_id) erase_sent_entry(evict_id);
     persist_sent_entry(e);
     xSemaphoreGive(s_mutex);
-}
-
-size_t idf_sent_count(void)
-{
-    ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return 0;
-    size_t count = s_sent_filled;
-    xSemaphoreGive(s_mutex);
-    return count;
-}
-
-bool idf_sent_get_newest(size_t index, IdfSentEntry& out)
-{
-    ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
-    if (index >= s_sent_filled) {
-        xSemaphoreGive(s_mutex);
-        return false;
-    }
-    size_t idx = (s_sent_head + SENT_MAX - 1 - index) % SENT_MAX;
-    out = s_sent[idx];
-    xSemaphoreGive(s_mutex);
-    return true;
 }
 
 std::string idf_inbox_json(bool sent_box, int limit)

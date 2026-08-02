@@ -2011,34 +2011,6 @@ IdfConfigWebView idf_config_get_web_view(void)
     return view;
 }
 
-IdfSchedStatusView idf_config_get_sched_view(void)
-{
-    IdfSchedStatusView view;
-    if (ensure_config_mutex() != ESP_OK) return view;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) view.tasks[i] = s_config.schedTasks[i];
-    view.tzOffsetMin = s_config.tzOffsetMin;
-    xSemaphoreGive(s_config_mutex);
-    return view;
-}
-
-IdfKeepaliveStatusView idf_config_get_keepalive_status_view(void)
-{
-    IdfKeepaliveStatusView view;
-    if (ensure_config_mutex() != ESP_OK) return view;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    view.kaEnabled = s_config.kaEnabled;
-    view.kaIntervalDays = s_config.kaIntervalDays;
-    view.kaAction = s_config.kaAction;
-    view.kaTarget = s_config.kaTarget;
-    view.kaUrl = s_config.kaUrl;
-    view.kaProfile = s_config.kaProfile;
-    view.kaLastTime = s_config.kaLastTime;
-    view.tzOffsetMin = s_config.tzOffsetMin;
-    xSemaphoreGive(s_config_mutex);
-    return view;
-}
-
 IdfKeepaliveRunView idf_config_get_keepalive_run_view(void)
 {
     IdfKeepaliveRunView view;
@@ -2268,15 +2240,6 @@ bool idf_config_email_configured(void)
     bool ok = email_configured_locked();
     xSemaphoreGive(s_config_mutex);
     return ok;
-}
-
-int idf_config_enabled_push_count(void)
-{
-    if (ensure_config_mutex() != ESP_OK) return 0;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    int count = enabled_push_count_locked();
-    xSemaphoreGive(s_config_mutex);
-    return count;
 }
 
 // 常数时间比对：逐字节累积差异，不因首字节不匹配提前返回，避免计时侧信道

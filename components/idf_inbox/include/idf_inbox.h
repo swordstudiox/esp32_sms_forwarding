@@ -28,12 +28,9 @@ void idf_inbox_mark_forwarded(uint32_t id);
 // 投递最终失败时把条目改回"未转发"，让用户能在收件箱看到并手动重发
 void idf_inbox_set_forwarded(uint32_t id, bool forwarded);
 size_t idf_inbox_count(void);
-bool idf_inbox_get_newest(size_t index, IdfInboxEntry& out);
 bool idf_inbox_get_by_id(uint32_t id, IdfInboxEntry& out);
 bool idf_inbox_delete(uint32_t id);
 
 void idf_sent_add(const char* target, const char* text, bool ok);
-size_t idf_sent_count(void);
-bool idf_sent_get_newest(size_t index, IdfSentEntry& out);
 
 std::string idf_inbox_json(bool sent_box, int limit);

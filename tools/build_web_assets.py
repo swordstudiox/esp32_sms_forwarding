@@ -38,10 +38,7 @@ PANELS = [
 @dataclass(frozen=True)
 class Asset:
     var: str
-    route_name: str
     mime: str
-    source: Path
-    content: bytes
     gz: bytes
     etag: str
 
@@ -86,7 +83,7 @@ def asset_hash(source_texts: list[str]) -> str:
     return h.hexdigest()[:12]
 
 
-def make_asset(var: str, route_name: str, mime: str, source: Path, text: str, rev: str) -> Asset:
+def make_asset(var: str, mime: str, source: Path, text: str, rev: str) -> Asset:
     text = text.replace("{{ASSET_HASH}}", rev)
     if source.suffix == ".css":
         text = minify_css(text)
@@ -94,10 +91,9 @@ def make_asset(var: str, route_name: str, mime: str, source: Path, text: str, re
         text = minify_js(text)
     else:
         text = minify_markup(text)
-    content = text.encode("utf-8")
-    gz = gzip_bytes(content)
+    gz = gzip_bytes(text.encode("utf-8"))
     etag = hashlib.sha256(gz).hexdigest()[:16]
-    return Asset(var, route_name, mime, source, content, gz, etag)
+    return Asset(var, mime, gz, etag)
 
 
 def c_array(data: bytes) -> str:
@@ -118,14 +114,14 @@ def build_assets() -> tuple[str, str]:
     rev = asset_hash(raw_sources)
 
     assets: list[Asset] = [
-        make_asset("WEB_INDEX", "index", "text/html", SRC / "index.html", raw_sources[0], rev),
-        make_asset("WEB_APP_CSS", "app.css", "text/css", SRC / "app.css", raw_sources[1], rev),
-        make_asset("WEB_APP_JS", "app.js", "application/javascript", SRC / "app.js", raw_sources[2], rev),
+        make_asset("WEB_INDEX", "text/html", SRC / "index.html", raw_sources[0], rev),
+        make_asset("WEB_APP_CSS", "text/css", SRC / "app.css", raw_sources[1], rev),
+        make_asset("WEB_APP_JS", "application/javascript", SRC / "app.js", raw_sources[2], rev),
         # 配网热点专用独立页(自包含，AP 模式下由 handle_root 单独下发)
-        make_asset("WEB_AP", "ap", "text/html", SRC / "ap.html", raw_sources[3], rev),
+        make_asset("WEB_AP", "text/html", SRC / "ap.html", raw_sources[3], rev),
     ]
     for name, text in zip(PANELS, raw_sources[4:]):
-        assets.append(make_asset(f"WEB_PANEL_{name.upper()}", name, "text/html", SRC / "panels" / f"{name}.html", text, rev))
+        assets.append(make_asset(f"WEB_PANEL_{name.upper()}", "text/html", SRC / "panels" / f"{name}.html", text, rev))
 
     header = f"""#ifndef WEB_ASSETS_H
 #define WEB_ASSETS_H
@@ -154,12 +150,6 @@ const WebAsset* findWebPanelAsset(const char* name);
     cpp_parts = [
         '#include "web_assets.h"',
         "#include <string.h>",
-        "#if defined(ARDUINO)",
-        "#include <pgmspace.h>",
-        "#define WEB_ASSET_STORAGE PROGMEM",
-        "#else",
-        "#define WEB_ASSET_STORAGE",
-        "#endif",
         "",
         "// 此文件由 tools/build_web_assets.py 生成；请修改 code/web_src/ 后重新生成。",
         f'const char WEB_ASSET_HASH[] = "{rev}";',
@@ -167,7 +157,7 @@ const WebAsset* findWebPanelAsset(const char* name);
     ]
     for asset in assets:
         arr_name = f"{asset.var}_DATA"
-        cpp_parts.append(f"static const uint8_t {arr_name}[] WEB_ASSET_STORAGE = {{")
+        cpp_parts.append(f"static const uint8_t {arr_name}[] = {{")
         cpp_parts.append(c_array(asset.gz))
         cpp_parts.append("};")
         cpp_parts.append(

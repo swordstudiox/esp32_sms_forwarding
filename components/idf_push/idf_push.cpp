@@ -30,6 +30,7 @@
 #include "idf_inbox.h"
 #include "idf_log.h"
 #include "idf_modem.h"
+#include "idf_util.h"
 #include "idf_wifi.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/ctr_drbg.h"
@@ -290,16 +291,7 @@ static void cancel_forward_completion(uint32_t completion_id)
 // "YYYY-MM-DD HH:MM:SS" 本地时间；时间未同步返回空串
 static std::string format_local_time(int tz_offset_min)
 {
-    time_t now = time(nullptr);
-    if (now < 1700000000) return {};
-    time_t shifted = now + static_cast<time_t>(tz_offset_min) * 60;
-    struct tm tmv = {};
-    gmtime_r(&shifted, &tmv);
-    char buf[40];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
-    return std::string(buf);
+    return idf_util_format_epoch_local(static_cast<uint32_t>(time(nullptr)), tz_offset_min);
 }
 
 // 在 UTF-8 字符边界截断，避免推送/邮件主题里出现半个汉字
@@ -309,15 +301,6 @@ static std::string utf8_truncate(const std::string& value, size_t max_bytes)
     size_t end = max_bytes;
     while (end > 0 && (static_cast<unsigned char>(value[end]) & 0xC0) == 0x80) --end;
     return value.substr(0, end) + "...";
-}
-
-static std::string trim(std::string value)
-{
-    size_t start = 0;
-    while (start < value.size() && isspace(static_cast<unsigned char>(value[start]))) ++start;
-    size_t end = value.size();
-    while (end > start && isspace(static_cast<unsigned char>(value[end - 1]))) --end;
-    return value.substr(start, end - start);
 }
 
 static std::string local_phone_number()
@@ -342,32 +325,11 @@ static bool parse_push_channel_token(const std::string& value, uint8_t& channel)
     return true;
 }
 
-static void json_escape_append(std::string& out, const std::string& value)
-{
-    for (char ch : value) {
-        switch (ch) {
-            case '\\': out += "\\\\"; break;
-            case '"': out += "\\\""; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(ch) < 0x20) {
-                    char buf[7];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
-                    out += buf;
-                } else {
-                    out += ch;
-                }
-        }
-    }
-}
-
 static std::string json_escape(const std::string& value)
 {
     std::string out;
     out.reserve(value.size() + 8);
-    json_escape_append(out, value);
+    idf_util_json_escape_append(out, value);
     return out;
 }
 
@@ -393,7 +355,7 @@ static void json_prop(std::string& out, const char* key, const std::string& valu
     out += "\"";
     out += key;
     out += "\":\"";
-    json_escape_append(out, value);
+    idf_util_json_escape_append(out, value);
     out += "\"";
 }
 
@@ -494,8 +456,8 @@ struct BarkTarget {
 static BarkTarget bark_target_from_channel(const IdfPushChannel& ch)
 {
     BarkTarget target;
-    std::string key = trim(ch.key1);
-    std::string raw_url = trim(ch.url);
+    std::string key = idf_util_trim_copy(ch.key1);
+    std::string raw_url = idf_util_trim_copy(ch.url);
     if (!key.empty()) {
         if (raw_url.empty()) raw_url = "https://api.day.app";
         if (!is_url_like(raw_url)) return target;
@@ -594,13 +556,13 @@ static void append_bark_params(std::string& json, const std::string& params,
                                const std::string& sender, const std::string& text,
                                const std::string& timestamp, const std::string& receiver)
 {
-    std::string spec = trim(params);
+    std::string spec = idf_util_trim_copy(params);
     if (!spec.empty() && spec[0] == '?') spec.erase(0, 1);
     size_t pos = 0;
     while (pos <= spec.size()) {
         size_t end = spec.find_first_of("&\n", pos);
         if (end == std::string::npos) end = spec.size();
-        std::string item = trim(spec.substr(pos, end - pos));
+        std::string item = idf_util_trim_copy(spec.substr(pos, end - pos));
         pos = end + (end < spec.size() ? 1 : 0);
         if (item.empty()) {
             if (end == spec.size()) break;
@@ -608,23 +570,23 @@ static void append_bark_params(std::string& json, const std::string& params,
         }
 
         size_t eq = item.find('=');
-        std::string key = trim(url_decode_component(eq == std::string::npos ? item : item.substr(0, eq)));
+        std::string key = idf_util_trim_copy(url_decode_component(eq == std::string::npos ? item : item.substr(0, eq)));
         if (key.empty() || bark_reserved_param(key)) {
             if (end == spec.size()) break;
             continue;
         }
 
         std::string value = eq == std::string::npos ? "1" : url_decode_component(item.substr(eq + 1));
-        value = apply_push_placeholders(trim(value), sender, text, timestamp, receiver);
+        value = apply_push_placeholders(idf_util_trim_copy(value), sender, text, timestamp, receiver);
         json += ",";
         json += "\"";
-        json_escape_append(json, key);
+        idf_util_json_escape_append(json, key);
         if (bark_numeric_param(key) && is_integer_literal(value)) {
             json += "\":";
             json += value;
         } else {
             json += "\":\"";
-            json_escape_append(json, value);
+            idf_util_json_escape_append(json, value);
             json += "\"";
         }
 
@@ -704,7 +666,7 @@ static ForwardDecision eval_forward_rules(const std::string& rules, const std::s
     while (pos < rules.size()) {
         size_t end = rules.find('\n', pos);
         if (end == std::string::npos) end = rules.size();
-        std::string line = trim(rules.substr(pos, end - pos));
+        std::string line = idf_util_trim_copy(rules.substr(pos, end - pos));
         pos = end + (end < rules.size() ? 1 : 0);
         if (line.empty()) continue;
 
@@ -715,7 +677,7 @@ static ForwardDecision eval_forward_rules(const std::string& rules, const std::s
         std::string type = line.substr(0, t1);
         std::string pat = line.substr(t1 + 1, t2 - t1 - 1);
         std::string action = t3 == std::string::npos ? line.substr(t2 + 1) : line.substr(t2 + 1, t3 - t2 - 1);
-        std::string enabled = t3 == std::string::npos ? "1" : trim(line.substr(t3 + 1));
+        std::string enabled = t3 == std::string::npos ? "1" : idf_util_trim_copy(line.substr(t3 + 1));
         if (enabled == "0" || pat.empty()) continue;
 
         bool hit = false;
@@ -729,7 +691,7 @@ static ForwardDecision eval_forward_rules(const std::string& rules, const std::s
         while (ap <= action.size()) {
             size_t comma = action.find(',', ap);
             if (comma == std::string::npos) comma = action.size();
-            std::string tok = trim(action.substr(ap, comma - ap));
+            std::string tok = idf_util_trim_copy(action.substr(ap, comma - ap));
             if (tok == "drop") d.drop = true;
             else if (tok == "email") d.email = true;
             else {
@@ -1125,13 +1087,13 @@ static std::string header_safe(std::string value)
 
 static std::string email_addr_only(std::string value)
 {
-    value = trim(value);
+    value = idf_util_trim_copy(value);
     size_t lt = value.find('<');
     size_t gt = value.find('>', lt == std::string::npos ? 0 : lt + 1);
     if (lt != std::string::npos && gt != std::string::npos && gt > lt + 1) {
         value = value.substr(lt + 1, gt - lt - 1);
     }
-    return header_safe(trim(value));
+    return header_safe(idf_util_trim_copy(value));
 }
 
 static std::string smtp_date_utc()
@@ -1193,7 +1155,7 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
         return false;
     }
 
-    std::string server = trim(cfg.smtpServer);
+    std::string server = idf_util_trim_copy(cfg.smtpServer);
     std::string from = email_addr_only(cfg.smtpUser);
     std::string to = email_addr_only(cfg.smtpSendTo);
     if (server.empty() || from.empty() || to.empty()) {
@@ -1355,8 +1317,8 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
             break;
         }
         case PUSH_TYPE_SERVERCHAN: {
-            std::string send_key = trim(channel.key1);
-            std::string base = trim(channel.url);
+            std::string send_key = idf_util_trim_copy(channel.key1);
+            std::string base = idf_util_trim_copy(channel.url);
             if (send_key.empty() && !base.empty() && !is_url_like(base)) {
                 send_key = base;
                 base.clear();

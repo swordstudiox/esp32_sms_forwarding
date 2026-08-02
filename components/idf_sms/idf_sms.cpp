@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <functional>
 #include <new>
 #include <string>
 #include <vector>
@@ -24,6 +25,7 @@
 #include "idf_log.h"
 #include "idf_modem.h"
 #include "idf_push.h"
+#include "idf_util.h"
 #include "pdulib.h"
 
 static constexpr size_t MAX_PDU_HEX_CHARS = 600;
@@ -64,10 +66,8 @@ struct ConcatSlot {
 };
 
 struct OutgoingSmsJob {
-    bool used = false;
     std::string phone;
     std::string text;
-    int64_t queuedUs = 0;
 };
 
 struct DecodedSms {
@@ -117,15 +117,6 @@ static void cleanup_start_resources()
     s_admin_reset_pending.store(false, std::memory_order_relaxed);
 }
 
-static std::string trim(std::string value)
-{
-    size_t start = 0;
-    while (start < value.size() && isspace(static_cast<unsigned char>(value[start]))) ++start;
-    size_t end = value.size();
-    while (end > start && isspace(static_cast<unsigned char>(value[end - 1]))) --end;
-    return value.substr(start, end - start);
-}
-
 // SIM 存储索引 0 是合法值；必须严格解析，不能让乱码被宽松转换成 0。
 static bool parse_sms_index_token(const char* start, size_t len, int& index)
 {
@@ -154,14 +145,10 @@ static bool is_hex_string(const std::string& line)
     return true;
 }
 
-static uint32_t fnv1a32(const std::string& text)
+// 仅供本次开机内的去重环使用，不要求跨重启稳定，直接用标准库哈希
+static uint32_t hash32(const std::string& text)
 {
-    uint32_t h = 2166136261u;
-    for (unsigned char ch : text) {
-        h ^= ch;
-        h *= 16777619u;
-    }
-    return h;
+    return static_cast<uint32_t>(std::hash<std::string>{}(text));
 }
 
 static bool seen_recently(uint32_t hash)
@@ -237,7 +224,7 @@ static bool number_blacklisted(const std::string& list, const std::string& sende
     while (pos <= list.size()) {
         size_t end = list.find('\n', pos);
         if (end == std::string::npos) end = list.size();
-        std::string line = trim(list.substr(pos, end - pos));
+        std::string line = idf_util_trim_copy(list.substr(pos, end - pos));
         if (!line.empty() && canonical_phone(line) == target) {
             return true;
         }
@@ -312,7 +299,7 @@ static void admin_reset_task(void*)
 
 static bool process_admin_command(const std::string& sender, const std::string& text)
 {
-    std::string cmd = trim(text);
+    std::string cmd = idf_util_trim_copy(text);
     if (!(starts_with(cmd, "SMS:") || cmd == "RESET")) return false;
 
     idf_logf("处理管理员命令 from=%s", sender.c_str());
@@ -324,8 +311,8 @@ static bool process_admin_command(const std::string& sender, const std::string& 
             idf_push_enqueue_email("命令执行失败", "SMS命令格式错误，正确格式: SMS:号码:内容");
             return true;
         }
-        std::string target = trim(cmd.substr(first + 1, second - first - 1));
-        std::string content = trim(cmd.substr(second + 1));
+        std::string target = idf_util_trim_copy(cmd.substr(first + 1, second - first - 1));
+        std::string content = idf_util_trim_copy(cmd.substr(second + 1));
         idf_logf("管理员命令目标号码: %s", target.c_str());
         if (!is_valid_phone_number(target)) {
             idf_log_line("目标号码非法，拒绝执行");
@@ -444,7 +431,7 @@ static int parse_cmti_index(const std::string& line)
 {
     size_t comma = line.rfind(',');
     if (comma == std::string::npos || comma + 1 >= line.size()) return -1;
-    std::string num = trim(line.substr(comma + 1));
+    std::string num = idf_util_trim_copy(line.substr(comma + 1));
     int index = -1;
     if (!parse_sms_index_token(num.c_str(), num.size(), index)) return -1;
     return index;
@@ -520,7 +507,7 @@ static bool concat_recently_done(int ref, const std::string& sender, int total,
     for (const auto& d : s_concat_done) {
         if (!d.used || now - d.doneUs > CONCAT_DONE_TTL_US) continue;
         if (d.ref == ref && d.total == total && d.sender == sender &&
-            d.partHash[part - 1] == fnv1a32(text)) {
+            d.partHash[part - 1] == hash32(text)) {
             return true;
         }
     }
@@ -537,7 +524,7 @@ static void record_concat_done(const ConcatSlot& slot)
     d.sender = slot.sender;
     d.partHash.fill(0);
     for (int i = 0; i < slot.total && i < static_cast<int>(CONCAT_PARTS); ++i) {
-        if (slot.parts[i].valid) d.partHash[i] = fnv1a32(slot.parts[i].text);
+        if (slot.parts[i].valid) d.partHash[i] = hash32(slot.parts[i].text);
     }
     d.doneUs = esp_timer_get_time();
 }
@@ -594,7 +581,7 @@ static void process_sms_content(const char* sender_raw, const char* text_raw, co
 
     // 去重键用 PDU 原始时间戳(双通道 URC+CMGL 收到的是同一原始值)；
     // 展示/转发用本地可读时间，未同步时才退回原始数字串
-    uint32_t hash = fnv1a32(sender + "|" + timestamp + "|" + text);
+    uint32_t hash = hash32(sender + "|" + timestamp + "|" + text);
     if (seen_recently(hash)) {
         idf_logf("重复短信 %s 已忽略", sender.c_str());
         return;
@@ -749,8 +736,8 @@ static void notify_incoming_call(const std::string& number)
     }
     std::string num = number.empty() ? std::string("未知号码") : number;
     std::string body = "来电：" + num;
-    std::string display_ts = format_epoch_local(static_cast<uint32_t>(time(nullptr)),
-                                                idf_config_get_tz_offset());
+    std::string display_ts = idf_util_format_epoch_local(static_cast<uint32_t>(time(nullptr)),
+                                                         idf_config_get_tz_offset());
     idf_logf("来电通知：%s，入队转发中", num.c_str());
     // 复用短信转发通道：发件人=来电号码，正文=来电提示，走与短信相同的推送+邮件
     if (!idf_push_enqueue_forward(num.c_str(), body.c_str(), display_ts.c_str(), 0)) {
@@ -792,7 +779,7 @@ static void flush_pending_call_notify(void)
 
 static void process_urc_line(const std::string& raw)
 {
-    std::string line = trim(raw);
+    std::string line = idf_util_trim_copy(raw);
     if (line.empty()) return;
 
     // 来电通知：RING/+CLIP 优先处理并返回，独立于短信 PDU 等待逻辑
@@ -871,7 +858,7 @@ static bool extract_first_stored_pdu(const std::string& resp, const char* header
     while (pos < resp.size()) {
         size_t nl = resp.find('\n', pos);
         if (nl == std::string::npos) nl = resp.size();
-        std::string line = trim(resp.substr(pos, nl - pos));
+        std::string line = idf_util_trim_copy(resp.substr(pos, nl - pos));
         pos = nl + 1;
         if (line.empty() || line == "OK" || line == "ERROR" ||
             starts_with(line, "+") || starts_with(line, "AT")) {
@@ -940,7 +927,7 @@ static void backfill_stored_sms(bool announce)
     while (pos < resp.size()) {
         size_t nl = resp.find('\n', pos);
         if (nl == std::string::npos) nl = resp.size();
-        std::string line = trim(resp.substr(pos, nl - pos));
+        std::string line = idf_util_trim_copy(resp.substr(pos, nl - pos));
         pos = nl + 1;
         if (!starts_with(line, "+CMGL:")) continue;
         if (handled >= BATCH_MAX) {
@@ -954,7 +941,7 @@ static void backfill_stored_sms(bool announce)
         while (pos < resp.size()) {
             nl = resp.find('\n', pos);
             if (nl == std::string::npos) nl = resp.size();
-            std::string candidate = trim(resp.substr(pos, nl - pos));
+            std::string candidate = idf_util_trim_copy(resp.substr(pos, nl - pos));
             if (starts_with(candidate, "+CMGL:")) break;  // PDU 缺失：别把下一条的头当 PDU 吞掉
             pos = nl + 1;
             if (candidate.empty() || candidate == "OK" || candidate == "ERROR" ||
@@ -1047,6 +1034,12 @@ static void sms_task(void*)
         expire_wait_pdu_window();
         flush_pending_call_notify();
         expire_concat_slots();
+
+        // eSIM 逻辑通道期间只收 URC，不插入 CPMS、CMGL 或短信发送 AT。
+        if (idf_modem_esim_operation_active()) {
+            idf_modem_wait_event(500);
+            continue;
+        }
 
         IdfModemStatus modem = idf_modem_get_status();
         if (modem.atReady && !configured) {
@@ -1228,7 +1221,7 @@ static std::string sms_response_error_line(const std::string& response)
     while (pos < response.size()) {
         size_t end = response.find('\n', pos);
         if (end == std::string::npos) end = response.size();
-        std::string line = trim(response.substr(pos, end - pos));
+        std::string line = idf_util_trim_copy(response.substr(pos, end - pos));
         for (const char* token : kTokens) {
             if (line.find(token) != std::string::npos) return line;
         }
@@ -1254,8 +1247,8 @@ static std::string sms_submit_failure_detail(esp_err_t err, const std::string& r
 esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& text_raw, std::string& message)
 {
     message.clear();
-    std::string phone = trim(phone_raw);
-    std::string text = trim(text_raw);
+    std::string phone = idf_util_trim_copy(phone_raw);
+    std::string text = idf_util_trim_copy(text_raw);
     if (!is_valid_phone_number(phone) || text.empty() || text.size() > 300) {
         message = "号码或内容无效";
         return ESP_ERR_INVALID_ARG;
@@ -1353,8 +1346,8 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
 
 esp_err_t idf_sms_enqueue_outgoing(const std::string& phone_raw, const std::string& text_raw, std::string& message)
 {
-    std::string phone = trim(phone_raw);
-    std::string text = trim(text_raw);
+    std::string phone = idf_util_trim_copy(phone_raw);
+    std::string text = idf_util_trim_copy(text_raw);
     message.clear();
     if (phone.empty()) {
         message = "错误：请输入目标号码";
@@ -1383,10 +1376,8 @@ esp_err_t idf_sms_enqueue_outgoing(const std::string& phone_raw, const std::stri
     }
 
     size_t tail = (s_out_head + s_out_count) % OUT_SMS_QUEUE_MAX;
-    s_out_queue[tail].used = true;
     s_out_queue[tail].phone = phone;
     s_out_queue[tail].text = text;
-    s_out_queue[tail].queuedUs = esp_timer_get_time();
     ++s_out_count;
     int depth = outgoing_depth_locked();
     xSemaphoreGive(s_out_mutex);

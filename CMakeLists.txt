@@ -2,5 +2,5 @@ cmake_minimum_required(VERSION 3.16)
 
 # 原生 ESP-IDF 固件工程入口；Arduino fallback 已移除。
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-set(PROJECT_VER "1.1.0-fork.1")
+set(PROJECT_VER "1.2.0-fork.v1.1.3")
 project(sms_forwarding_idf)

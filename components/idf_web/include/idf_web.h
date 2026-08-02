@@ -8,7 +8,6 @@ extern "C" {
 #endif
 
 esp_err_t idf_web_start(void);
-void idf_web_stop(void);
 
 #ifdef __cplusplus
 }

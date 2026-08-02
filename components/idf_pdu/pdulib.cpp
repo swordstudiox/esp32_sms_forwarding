@@ -35,12 +35,8 @@
   *        Fix issue #46  set default SCA
  */
 
-#ifndef DESKTOP_PDU
-#include <Arduino.h>
-#else
 #include <math.h>
 #include <string.h>
-#endif
 #include <ctype.h>
 #include <new>
 #include <pdulib.h>
@@ -65,11 +61,7 @@ PDU::~PDU() {
 }
 
 // array must be defined before its use in sizeof statement
-const
-#ifdef PM
-    PROGMEM
-#endif
-    struct sRange gsm7_legal[] = {
+const struct sRange gsm7_legal[] = {
         // 只列可无损表示的 GSM7 字符。U+00A6(¦) 与 U+00C8(È) 在旧转换表中是
         // “近似替换”的负值，若误判成 GSM7 会分别落成 '_' 与 'a'；排除后改走 UCS2。
         {10, 10}, {13, 13}, {32, 95}, {97, 126}, {161, 161}, {163, 165}, {167, 167}, {191, 191}, {196, 199}, {201, 201}, {209, 209}, {214, 214}, {216, 216}, {220, 220}, {223, 224}, {228, 230}, {232, 233}, {236, 236}, {241, 242}, {246, 246}, {248, 249}, {252, 252}, {915, 916}, {920, 920}, {923, 923}, {926, 926}, {928, 928}, {931, 931}, {934, 934}, {936, 937}, // greek
@@ -164,35 +156,9 @@ void PDU::stringToBCD(const char *number, char *pdu)
     {
       // prime in case this is the last byte
       pdu[targetindex] = 0xf0;
-      //      pdu[targetindex] &= 0xf0;  // clear lower
       pdu[targetindex] += *number++ - '0';
     }
   }
-}
-
-void PDU::digitSwap(const char *number, char *pdu)
-{
-  int j, targetindex = 0;
-  if (*number == '+') // ignore leading +
-    number++;
-  for (j = 0; j < addressLength; j++)
-  {
-    if ((j & 1) == 1) // odd, upper
-    {
-      pdu[targetindex] = *number++;
-      targetindex += 2;
-    }
-    else
-    { // even lower
-      pdu[targetindex + 1] = *number++;
-    }
-  }
-  if ((addressLength & 1) == 1)
-  {
-    pdu[targetindex] = 'F';
-    targetindex += 2;
-  }
-  pdu[targetindex++] = 0;
 }
 
 /*
@@ -229,21 +195,12 @@ int PDU::convert_utf8_to_gsm7bit(const char *message, char *gsm7bit, int udhsize
     }
     else if (target >= GREEK_UCS_MINIMUM)
     {
-#ifdef PM
-      *gsm7bit++ = pgm_read_word(lookup_UnicodeToGreek7 + target - GREEK_UCS_MINIMUM);
-#else
       *gsm7bit++ = lookup_UnicodeToGreek7[target - GREEK_UCS_MINIMUM];
-#endif
       w++;
     }
     else
     {
-#ifdef PM
-      short x = pgm_read_word(lookup_ascii8to7 + target);
-#else
       short x = lookup_ascii8to7[target];
-#endif
-      //     Serial.print(target);Serial.print(" ");Serial.println(x);
       if (x > 256)
       { // this is an escaped character
         *gsm7bit++ = 27;
@@ -258,12 +215,9 @@ int PDU::convert_utf8_to_gsm7bit(const char *message, char *gsm7bit, int udhsize
     }
     message += length; // bump to next character
     // check not exceeding max 160 characters for GSM7
-  //  if (w > bufferSize - udhsize)
-    //  break;
     if (w > MAX_SMS_LENGTH_7BIT)
       break;
   }
-//  return w > (bufferSize - udhsize) ? WORK_BUFFER_TOO_SMALL : w;
   return w > MAX_SMS_LENGTH_7BIT ? GSM7_TOO_LONG : w;
 }
 /*
@@ -305,28 +259,12 @@ int PDU::utf8_to_packed7bit(const char *utf8, char *pdu, int *septets, int udhsi
 int PDU::buildUDH(unsigned short csms, unsigned numparts, unsigned partnumber)
 {
   int offset = 0;
-  // Issue 36  extra padding byte prepended to all messages
-  // caused by following check that tries to be clever and save a byte
-  // temporary fix, cancel the check
-#if 0
-  if (csms <= 255)
-  {
-    udhbuffer[offset++] = 5; // length
-    udhbuffer[offset++] = 0; // IEI
-    udhbuffer[offset++] = 3; // len IEL
-    udhbuffer[offset++] = csms;
-  }
-  else
-  {
-#endif
-    udhbuffer[offset++] = 6;           // length
-    udhbuffer[offset++] = 8;           // IEI
-    udhbuffer[offset++] = 4;           // len IEL
-    udhbuffer[offset++] = csms >> 8;   // hi byte
-    udhbuffer[offset++] = csms & 0xff; // lo byte
-#if 0
-  }
-#endif
+  // Issue 36: 统一使用 16 位引用号的 UDH，避免 8 位引用号省字节导致的填充问题
+  udhbuffer[offset++] = 6;           // length
+  udhbuffer[offset++] = 8;           // IEI
+  udhbuffer[offset++] = 4;           // len IEL
+  udhbuffer[offset++] = csms >> 8;   // hi byte
+  udhbuffer[offset++] = csms & 0xff; // lo byte
   udhbuffer[offset++] = numparts;
   udhbuffer[offset++] = partnumber;
   return offset;
@@ -346,7 +284,6 @@ int PDU::encodePDU(const char *recipient, const char *message, unsigned short cs
   char tempbuf[PDU_BINARY_MAX_LENGTH];
   smsOffset = 0;
   int beginning = 0;
- // bool intl = *recipient == '+';
   enum eDCS dcs = ALPHABET_7BIT;
   overFlow = false;
   /* sanity check that concatenation parameters all zero or all not zero */
@@ -418,13 +355,6 @@ int PDU::encodePDU(const char *recipient, const char *message, unsigned short cs
     pduLengthPlaceHolder = smsOffset;
     tempbuf[smsOffset++] = 1; // placeholder for length in septets
     // insert UDH if any
-#if 0
-    if (udhsize == 6)    // Issue 36 This test now redundant 
-    { // 1 byte ref number, need to pad UDH to 7 octets
-      udhbuffer[6] = 0x40;
-      udhsize++;
-    }
-#endif
     if (udhsize != 0)
     {
       memcpy(&tempbuf[smsOffset], udhbuffer, udhsize);
@@ -433,7 +363,6 @@ int PDU::encodePDU(const char *recipient, const char *message, unsigned short cs
     delta = utf8_to_packed7bit(savem, &tempbuf[smsOffset], &septetcount, udhsize == 0 ? 0 : 8, /*generalWorkBuffLength - smsOffset*/MAX_NUMBER_OCTETS);
     if (delta < 0) {
       overFlow = delta == WORK_BUFFER_TOO_SMALL;
-//      return delta;
     }
     else {
       tempbuf[pduLengthPlaceHolder] = septetcount;
@@ -466,7 +395,6 @@ int PDU::encodePDU(const char *recipient, const char *message, unsigned short cs
     return delta;
 
   // now convert from binary to printable
-//  memcpy(tempbuf, generalWorkBuff, length);
   // each byte in tempbuf converts to 2 bytes in generalworkbuff
   if (generalWorkBuffLength < (length*2)) {
     overFlow = true;
@@ -490,9 +418,6 @@ unsigned char PDU::gethex(const char *pc)
   int i;
   // bug Issue 27, some modems present HEX characters as lowercase a-f
   // convert all to uppercase
-  //if (islower(*pc)) {
-  //  char LCC = *pc;
- // }
   char PC = toupper(*pc);
   if (isdigit(PC))
     i = ((unsigned char)(PC) - '0') * 16;
@@ -559,15 +484,9 @@ int PDU::convert_7bit_to_unicode(unsigned char *gsm7bit, int length, char *unico
       unicode[w] = 0;  // add end marker
       return w;
     }
-#ifdef PM
-    if ((pgm_read_byte(lookup_gsm7toUnicode + gsm7bit[r]) != 27))
-    {
-      const unsigned char C = pgm_read_byte(lookup_gsm7toUnicode + (unsigned char)gsm7bit[r]);
-#else
     if ((lookup_gsm7toUnicode[(unsigned char)gsm7bit[r]]) != 27)
     {
       const unsigned char C = lookup_gsm7toUnicode[(unsigned char)gsm7bit[r]];
-#endif
       /* Greek 7 bit was initially not handled as the lookup table was just 8 bit, presumably
          to save space.
          Now add a 7 bit to 16 bit just for those unhgandled greek characters
@@ -578,11 +497,7 @@ int PDU::convert_7bit_to_unicode(unsigned char *gsm7bit, int length, char *unico
         w += buildUtf(C, &unicode[w]);
       else
       {
-#ifdef PM
-        unsigned short S = pgm_read_word(lookup_Greek7ToUnicode + (gsm7bit[r] - 16));
-#else
         unsigned short S = lookup_Greek7ToUnicode[gsm7bit[r] - 16];
-#endif
         w += buildUtf(S, &unicode[w]);
       }
     }
@@ -901,7 +816,6 @@ bool PDU::decodePDU(const char *pdu)
     }
     i = pduGsm7_to_unicode(&pdu[index], dulength, (char *)generalWorkBuff,udhfollower);
     generalWorkBuff[i] = 0;
-  //  utf8length = i;
     rc = true;
     break;
   case DCS_8BIT_ALPHABET_MASK:
@@ -929,7 +843,6 @@ bool PDU::decodePDU(const char *pdu)
       memcpy(generalWorkBuff + utfoffset, utf8tmp, utflength);
       utfoffset += utflength;
     }
-  //  utf8length = utfoffset;
     generalWorkBuff[utfoffset] = 0; // end marker
     rc = true;
     break;
@@ -1265,7 +1178,6 @@ int PDU::utf8_to_ucs2(const char *utf8, char *ucs2)
     int inputlen = utf8Length(utf8);
     if (inputlen <= 0)
       return UCS2_TOO_LONG;
-    //    int ucslength = utf8_to_ucs2_single(utf8,(short *)ucs2);
     ucslength = utf8_to_ucs2_single(utf8, tempucs2);
     // sanity check against overflowing the buffer
     if (octets + ucslength > MAX_NUMBER_OCTETS)
@@ -1297,15 +1209,6 @@ void PDU::setSCAnumber(const char *n)
 void PDU::setSCAnumber()
 {
   *scabuffout = 0;
-}
-const char *PDU::getSCAnumber()
-{
-  return scabuffin; // from INCOMING SMS
-}
-
-void PDU::buildUtf16(unsigned long cp, char *target)
-{
-  buildUtf(cp, target); // for backward compatibility
 }
 
 int PDU::buildUtf(unsigned long cp, char *target)
@@ -1383,11 +1286,7 @@ bool PDU::isGSM7(unsigned short *pucs)
 {
   for (unsigned int i = 0; i < sizeof(gsm7_legal) / sizeof(sRange); i++)
   {
-#ifdef PM
-    if (*pucs >= pgm_read_word(&gsm7_legal[i].min) && *pucs <= pgm_read_word(&gsm7_legal[i].max))
-#else
     if (*pucs >= gsm7_legal[i].min && *pucs <= gsm7_legal[i].max)
-#endif
       return true;
   }
   return false;
@@ -1396,10 +1295,6 @@ bool PDU::isGSM7(unsigned short *pucs)
 int *PDU::getConcatInfo()
 {
   return concatInfo;
-}
-
-bool PDU::getOverflow() {
-  return overFlow;
 }
 /****************************************************************************
 This lookup table converts from ISO-8859-1 8-bit ASCII to the
@@ -1423,11 +1318,7 @@ marked in the table by having 256 added to its value.
     The tables is indexed by a unicode value and returns the GSM7 value for that symbol
     TBD change name to reflect lookup Unicode to GSM7
 */
-const
-#ifdef PM
-    PROGMEM
-#endif
-    short lookup_ascii8to7[] = {
+const short lookup_ascii8to7[] = {
         NPC7,     /*     0      null [NUL]                              */
         NPC7,     /*     1      start of heading [SOH]                  */
         NPC7,     /*     2      start of text [STX]                     */
@@ -1704,11 +1595,7 @@ a special meaning and must be handled separately.
    TBD change name to relect lookup GSM7 to Unicode
 */
 
-const
-#ifdef PM
-    PROGMEM
-#endif
-    unsigned char lookup_gsm7toUnicode[] = {
+const unsigned char lookup_gsm7toUnicode[] = {
         64,   /*  0      @  COMMERCIAL AT                           */
         163,  /*  1      £  POUND SIGN                              */
         36,   /*  2      $  DOLLAR SIGN                             */
@@ -1855,11 +1742,7 @@ const
 /*
    Decode Greek marked as NPC8 in lookup_gsm7toUnicode
 */
-const
-#ifdef PM
-    PROGMEM
-#endif
-    unsigned short lookup_Greek7ToUnicode[] = {
+const unsigned short lookup_Greek7ToUnicode[] = {
         0x394, /*  16        GREEK CAPITAL LETTER DELTA              */
         95,    /*  17     _  LOW LINE                                */
         0x3a6, /*  18        GREEK CAPITAL LETTER PHI                */
@@ -1876,11 +1759,7 @@ const
 /*
    Decode Greek marked as NPC8 in lookup_gsm7toUnicode
 */
-const
-#ifdef PM
-    PROGMEM
-#endif
-    unsigned short lookup_UnicodeToGreek7[] = {
+const unsigned short lookup_UnicodeToGreek7[] = {
         19, /* GREEK CAPITAL LETTER GAMMA  0x393            */
         16, /* GREEK CAPITAL LETTER DELTA  0x394          */
         0,  /* 0x395 */

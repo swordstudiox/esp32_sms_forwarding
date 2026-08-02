@@ -10,7 +10,7 @@
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
 static constexpr int IDF_MAX_WIFI_NETWORKS = 5;
-static constexpr const char* IDF_FW_VERSION = "1.1.0-fork.1";
+static constexpr const char* IDF_FW_VERSION = "1.2.0-fork.v1.1.3";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
 static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "http://gg.incrafttime.top/api/payload?size=64342";
@@ -199,24 +199,6 @@ struct IdfConfigWebView {
     IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
 };
 
-// /schedtask 状态轮询(任务执行期间每 2s)专用窄快照：
-// 只拷贝任务槽 + 时区，避免全量配置(含推送通道大字符串)反复深拷贝
-struct IdfSchedStatusView {
-    IdfSchedTask tasks[IDF_MAX_SCHED_TASKS];
-    int tzOffsetMin = 480;
-};
-
-struct IdfKeepaliveStatusView {
-    bool kaEnabled = false;
-    int kaIntervalDays = 175;
-    uint8_t kaAction = 1;
-    std::string kaTarget;
-    std::string kaUrl = IDF_KEEPALIVE_DEFAULT_URL;
-    std::string kaProfile;
-    uint32_t kaLastTime = 0;
-    int tzOffsetMin = 480;
-};
-
 // 保号执行任务专用快照：只带动作所需字段，避免把整份配置拷进后台任务参数
 struct IdfKeepaliveRunView {
     bool kaEnabled = false;
@@ -303,8 +285,6 @@ struct IdfSchedulerView {
 IdfConfig idf_config_get(void);
 IdfConfigStatusView idf_config_get_status_view(void);
 IdfConfigWebView idf_config_get_web_view(void);
-IdfSchedStatusView idf_config_get_sched_view(void);
-IdfKeepaliveStatusView idf_config_get_keepalive_status_view(void);
 IdfKeepaliveRunView idf_config_get_keepalive_run_view(void);
 IdfSchedRunView idf_config_get_sched_run_view(int index);
 IdfSimSettingsView idf_config_get_sim_settings_view(void);
@@ -314,8 +294,6 @@ IdfPushNotifyView idf_config_get_push_notify_view(void);
 IdfEmailSettingsView idf_config_get_email_settings_view(void);
 IdfSchedulerView idf_config_get_scheduler_view(void);
 bool idf_config_get_push_channel(uint8_t channel, IdfPushChannel& out);
-bool idf_config_has_sta_credentials(void);
-int idf_config_enabled_push_count(void);
 bool idf_config_email_configured(void);
 // 锁内直接比对 Web 凭据，避免每个 HTTP 请求做一次全量配置深拷贝
 bool idf_config_check_web_auth(const char* user, const char* pass);

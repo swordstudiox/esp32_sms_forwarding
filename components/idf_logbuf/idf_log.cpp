@@ -1,4 +1,5 @@
 #include "idf_log.h"
+#include "idf_util.h"
 
 #include <inttypes.h>
 #include <stdarg.h>
@@ -278,27 +279,6 @@ static void ensure_init()
     if (!s_log_mutex) s_log_mutex = xSemaphoreCreateMutex();
 }
 
-static void json_escape_append(std::string& out, const std::string& value)
-{
-    for (char ch : value) {
-        switch (ch) {
-            case '\\': out += "\\\\"; break;
-            case '"': out += "\\\""; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(ch) < 0x20) {
-                    char buf[7];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
-                    out += buf;
-                } else {
-                    out += ch;
-                }
-        }
-    }
-}
-
 void idf_log_init(void)
 {
     ensure_init();
@@ -388,7 +368,7 @@ std::string idf_log_json_since(uint32_t since)
         if (!first) out += ",";
         first = false;
         out += "\"";
-        json_escape_append(out, s_lines[(start + i) % LOG_RING_SIZE]);
+        idf_util_json_escape_append(out, s_lines[(start + i) % LOG_RING_SIZE]);
         out += "\"";
     }
     out += "]}";

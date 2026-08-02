@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 from pathlib import Path
 
@@ -26,10 +25,6 @@ def read(path: Path) -> str:
         .replace("89440000000000000000", "8944••••••••••0000")
         .replace("234100000000000", "23410••••••••000")
     )
-
-
-def response_js(obj, text: str | None = None) -> str:
-    return json.dumps(obj, ensure_ascii=False) if text is None else json.dumps(text, ensure_ascii=False)
 
 
 index = read(SRC / "index.html")
@@ -271,5 +266,5 @@ index = index.replace('<link rel="stylesheet" href="/assets/app.css?v=preview">'
 index = index.replace('<script src="/assets/app.js?v=preview" defer></script>', stub + "\n<script>\n" + js + "\n</script>")
 
 OUT.parent.mkdir(parents=True, exist_ok=True)
-io.open(OUT, "w", encoding="utf-8", newline="").write(index)
+open(OUT, "w", encoding="utf-8", newline="").write(index)
 print(f"generated {OUT}")
