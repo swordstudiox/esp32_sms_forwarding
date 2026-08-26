@@ -18,7 +18,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
-#include "freertos/task.h"
 #include "idf_log.h"
 #include "idf_util.h"
 #include "nvs.h"
@@ -785,15 +784,44 @@ static std::string parse_iccid_response(const std::string& raw)
     // 部分固件会在 ICCID 前后附加槽位或状态字段，退回提取响应中的连续数字。
     return first_digit_run(raw, 15, 22);
 }
+static std::string parse_iccid_crsm_response(const std::string& raw)
+{
+    size_t marker = raw.find("+CRSM:");
+    if (marker == std::string::npos) return {};
+    long sw1 = 0;
+    long sw2 = 0;
+    if (sscanf(raw.c_str() + marker, "+CRSM: %ld,%ld", &sw1, &sw2) != 2 ||
+        (sw1 != 144 && sw1 != 145) || sw2 != 0) return {};
+    std::string encoded = first_quoted(raw, marker);
+    if (encoded.size() != 20) return {};
+
+    std::string value;
+    value.reserve(encoded.size());
+    for (size_t i = 0; i < encoded.size(); i += 2) {
+        char low = static_cast<char>(toupper(static_cast<unsigned char>(encoded[i + 1])));
+        char high = static_cast<char>(toupper(static_cast<unsigned char>(encoded[i])));
+        if ((!isdigit(static_cast<unsigned char>(low)) && low != 'F') ||
+            (!isdigit(static_cast<unsigned char>(high)) && high != 'F')) return {};
+        value += low;
+        value += high;
+    }
+    if (!value.empty() && value.back() == 'F') value.pop_back();
+    for (char ch : value) if (!isdigit(static_cast<unsigned char>(ch))) return {};
+    return is_iccid_text(value) ? value : std::string();
+}
 
 static std::string query_current_iccid(void)
 {
-    const char* commands[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
-    std::string resp;
-    for (const char* cmd : commands) {
-        if (!send_ok(cmd, 1500, &resp)) continue;
-        std::string iccid = parse_iccid_response(resp);
+    static constexpr const char* kCommands[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
+    std::string response;
+    for (const char* command : kCommands) {
+        if (!send_ok(command, 1500, &response)) continue;
+        std::string iccid = parse_iccid_response(response);
         if (!iccid.empty()) return iccid;
+    }
+    // EF_ICCID 可在部分 PIN 锁卡或厂商 ICCID 命令不可用时通过标准受限 SIM 访问读取。
+    if (send_ok("AT+CRSM=176,12258,0,0,10", 2000, &response)) {
+        return parse_iccid_crsm_response(response);
     }
     return {};
 }
@@ -1921,12 +1949,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     }
 
     if (before.iccid.size() < 15) {
-        const char* iccid_cmds[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
-        for (const char* cmd : iccid_cmds) {
-            if (!patch.iccid.empty()) break;
-            if (send_ok(cmd, 1500, &resp)) patch.iccid = parse_iccid_response(resp);
-            vTaskDelay(pdMS_TO_TICKS(80));
-        }
+        patch.iccid = query_current_iccid();
         vTaskDelay(pdMS_TO_TICKS(150));
     }
 
