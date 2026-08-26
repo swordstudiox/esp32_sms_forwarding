@@ -9,6 +9,7 @@
 
 #include <string>
 #include <vector>
+#include <utility>
 #include <stdlib.h>
 #include <new>
 
@@ -27,6 +28,7 @@
 #include "idf_config.h"
 #include "idf_esim.h"
 #include "idf_inbox.h"
+#include "idf_lpa.h"
 #include "idf_log.h"
 #include "idf_modem.h"
 #include "idf_push.h"
@@ -34,7 +36,7 @@
 #include "idf_util.h"
 #include "idf_wifi.h"
 #include "mbedtls/base64.h"
-#include "mbedtls/sha256.h"
+#include "mbedtls/md.h"
 #include "nvs.h"
 #include "web_assets.h"
 
@@ -51,6 +53,10 @@ struct WebAsyncJob {
     std::string url;
     std::string action;
     std::string message;
+    // 仅保存安装预览所需的非敏感值；完整 Activation Code/MatchingID 不进入 job。
+    std::string installHost;
+    std::string installMatchingIdMasked;
+    std::string installPhase;
 };
 
 struct EsimWebCache {
@@ -65,6 +71,9 @@ static WebAsyncJob s_esim_job;
 static WebAsyncJob s_sched_job;
 static int s_sched_job_index = -1;
 static EsimWebCache s_esim_cache;
+// Confirmation Code 只在等待期间保存在 RAM，绝不放入 WebAsyncJob/status。
+static std::string s_esim_confirmation_code;
+static bool s_esim_confirmation_submitted = false;
 static bool s_modem_apply_running = false;
 static bool s_web_modem_action_running = false;
 
@@ -180,11 +189,23 @@ static bool is_ap_open_uri(const char* uri)
     return false;
 }
 
-// 跨站 POST 防护：浏览器发起的跨站表单/fetch 必带 Origin，与 Host 不一致即拒绝。
-// 变更类操作均已强制 POST，GET 一律放行；curl/脚本不带 Origin 不受影响。
+// 跨站 POST 防护，按可信度分层：
+// 1. 带 X-SMS-CSRF 自定义头直接放行——跨站页面无法附带自定义头(会触发本服务不响应
+//    的 CORS 预检)，能带上的必是本站前端或用户自己的脚本；也救活反代改写 Host 的部署。
+// 2. Sec-Fetch-Site 为 cross-site 一律拒绝：现代浏览器所有请求都带该头，可补
+//    个别隐私插件剥离 Origin 造成的盲区。
+// 3. Origin 与 Host 不一致拒绝。变更类操作均已强制 POST，GET 一律放行；
+//    curl/脚本不带 Origin 与 Sec-Fetch-Site，不受影响。
 static bool origin_allowed(httpd_req_t* req)
 {
     if (req->method != HTTP_POST) return true;
+    char csrf[8] = {};
+    if (httpd_req_get_hdr_value_str(req, "X-SMS-CSRF", csrf, sizeof(csrf)) == ESP_OK) return true;
+    char sfs[24] = {};
+    if (httpd_req_get_hdr_value_str(req, "Sec-Fetch-Site", sfs, sizeof(sfs)) == ESP_OK &&
+        strcasecmp(sfs, "cross-site") == 0) {
+        return false;
+    }
     char origin[160] = {};
     if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) != ESP_OK) return true;
     if (strcmp(origin, "null") == 0) return false;  // 沙箱 iframe 等匿名来源
@@ -229,13 +250,11 @@ static bool check_auth(httpd_req_t* req)
     return false;
 }
 
+// 写接口的跨站兜底：复用 origin_allowed 的分层判定(自定义头/Sec-Fetch-Site/Origin)，
+// 返回 JSON 错误。check_auth 已前置同一校验，这里防的是未来重构改动调用顺序。
 static bool check_csrf(httpd_req_t* req)
 {
-    char token[16] = {};
-    if (httpd_req_get_hdr_value_str(req, "X-SMS-CSRF", token, sizeof(token)) == ESP_OK &&
-        strcmp(token, "1") == 0) {
-        return true;
-    }
+    if (origin_allowed(req)) return true;
     set_json_no_cache(req);
     httpd_resp_set_status(req, "403 Forbidden");
     httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"跨站写入校验失败，请刷新页面后重试\"}");
@@ -375,6 +394,10 @@ static esp_err_t handle_status(httpd_req_t* req)
              modem.identityFresh ? "true" : "false",
              WEB_ASSET_HASH);
     body += buf;
+    json_prop(body, "simState", modem.simState); body += ",";
+    body += "\"simCredentialMatched\":";
+    body += modem.simCredentialMatched ? "true," : "false,";
+    json_prop(body, "simUnlockMessage", modem.simUnlockMessage); body += ",";
     snprintf(buf, sizeof(buf), "\"tz\":%d,", cfg.tzOffsetMin);
     body += buf;
     snprintf(buf, sizeof(buf), "\"nowEpoch\":%ld,", static_cast<long>(now));
@@ -456,7 +479,6 @@ static esp_err_t handle_status(httpd_req_t* req)
     }
 
     json_prop(body, "adminPhone", cfg.adminPhone); body += ",";
-    // 手填优先于 CNUM：模组读不到或读错本机号码时，可用网络设置纠正。
     json_prop(body, "phone", !cfg.phoneNumber.empty() ? cfg.phoneNumber : modem.phone); body += ",";
     json_prop(body, "apn", cfg.apn); body += ",";
     json_prop(body, "apnSim", modem.apnSim); body += ",";
@@ -489,23 +511,6 @@ static esp_err_t send_config_json(httpd_req_t* req)
     body.reserve(4096);
     char buf[256];
     body += "{";
-    json_prop(body, "wifiSsid", cfg.wifiSsid); body += ",";
-    json_prop(body, "wifiSsid2", cfg.wifiSsid2); body += ",";
-    snprintf(buf, sizeof(buf), "\"wifiCount\":%u,", static_cast<unsigned>(cfg.wifiNetworkCount));
-    body += buf;
-    body += "\"wifiNetworks\":[";
-    for (int i = 0; i < cfg.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS; ++i) {
-        if (i) body += ",";
-        const IdfWifiNetwork& net = cfg.wifiNetworks[i];
-        body += "{";
-        json_prop(body, "ssid", net.ssid); body += ",";
-        snprintf(buf, sizeof(buf), "\"passSet\":%s,\"fallback\":%s",
-                 net.pass.empty() ? "false" : "true",
-                 net.fallback ? "true" : "false");
-        body += buf;
-        body += "}";
-    }
-    body += "],";
     json_prop(body, "webUser", cfg.webUser); body += ",";
     // 密码字段只用于表单占位，不能在配置 JSON 中回显明文。
     json_prop(body, "webPass", ""); body += ",";
@@ -553,6 +558,34 @@ static esp_err_t send_config_json(httpd_req_t* req)
     body += "\"callNotifyEnabled\":";
     body += cfg.callNotifyEnabled ? "true" : "false";
     body += ",";
+    snprintf(buf, sizeof(buf), "\"wifiCount\":%u,\"wifiTxPowerQuarterDbm\":%u,",
+             cfg.wifiNetworkCount, cfg.wifiTxPowerQuarterDbm);
+    body += buf;
+    body += "\"simCredentials\":[";
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        if (i) body += ",";
+        const IdfSimCredentialView& item = cfg.simCredentials[i];
+        body += "{";
+        json_prop(body, "iccid", item.iccid); body += ",";
+        snprintf(buf, sizeof(buf),
+                 "\"pinSet\":%s,\"pukSet\":%s,\"pinMax\":%u,\"pukMax\":%u,"
+                 "\"pinFailed\":%u,\"pukFailed\":%u}",
+                 item.pinSet ? "true" : "false", item.pukSet ? "true" : "false",
+                 item.pinMaxAttempts, item.pukMaxAttempts,
+                 item.pinFailedAttempts, item.pukFailedAttempts);
+        body += buf;
+    }
+    body += "],";
+    body += "\"wifiNetworks\":[";
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (i) body += ",";
+        body += "{";
+        json_prop(body, "ssid", cfg.wifiNetworks[i].ssid);
+        body += ",\"passSet\":";
+        body += cfg.wifiNetworks[i].passSet ? "true" : "false";
+        body += "}";
+    }
+    body += "],";
     body += "\"pushChannels\":[";
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         if (i) body += ",";
@@ -739,6 +772,20 @@ static std::string field_text(const IdfFormFields& fields, const char* key)
     return value ? *value : std::string();
 }
 
+static void clear_sensitive_form_values(IdfFormFields& fields)
+{
+    for (auto& field : fields) idf_lpa_clear_sensitive(field.second);
+}
+
+static size_t field_count(const IdfFormFields& fields, const char* key)
+{
+    size_t count = 0;
+    for (const auto& field : fields) {
+        if (field.first == key) ++count;
+    }
+    return count;
+}
+
 static bool field_blank(const std::string& value)
 {
     for (char ch : value) {
@@ -822,34 +869,6 @@ static std::string first_line_containing(const std::string& resp, const char* ne
     while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
     while (!line.empty() && isspace(static_cast<unsigned char>(line.front()))) line.erase(0, 1);
     return line;
-}
-
-static std::string first_digits(const std::string& resp)
-{
-    size_t pos = 0;
-    while (pos < resp.size()) {
-        size_t end = resp.find('\n', pos);
-        if (end == std::string::npos) end = resp.size();
-        std::string line = resp.substr(pos, end - pos);
-        while (!line.empty() && isspace(static_cast<unsigned char>(line.front()))) line.erase(0, 1);
-        while (!line.empty() && isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
-        bool digits = !line.empty();
-        for (char ch : line) digits = digits && isdigit(static_cast<unsigned char>(ch));
-        if (digits && line.size() >= 14 && line.size() <= 17) return line;
-        pos = end + 1;
-    }
-
-    size_t start = std::string::npos;
-    for (size_t i = 0; i <= resp.size(); ++i) {
-        bool digit = i < resp.size() && isdigit(static_cast<unsigned char>(resp[i]));
-        if (digit && start == std::string::npos) start = i;
-        if (!digit && start != std::string::npos) {
-            size_t len = i - start;
-            if (len >= 14 && len <= 17) return resp.substr(start, len);
-            start = std::string::npos;
-        }
-    }
-    return {};
 }
 
 static bool parse_cfun_mode_line(const std::string& line, int& mode)
@@ -1004,17 +1023,22 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
     bool needs_modem = (action == "restart" || action == "hardreset" ||
                         action == "write_own_number" ||
                         action == "signal" || action == "operator" || action == "imei");
-    if ((action == "restart" || action == "hardreset" || action == "write_own_number") &&
-        req->method != HTTP_POST) {
+    if ((action == "restart" || action == "hardreset" || action == "sim-puk" ||
+         action == "write_own_number") && req->method != HTTP_POST) {
         set_json_no_cache(req);
         const char* msg = action == "write_own_number"
             ? "{\"success\":false,\"message\":\"写入 SIM 本机号码需要 POST\"}"
-            : "{\"success\":false,\"message\":\"模组重启需要 POST\"}";
+            : "{\"success\":false,\"message\":\"该操作需要 POST\"}";
         return httpd_resp_sendstr(req, msg);
     }
     if (needs_modem && !modem_action.begin(req)) return ESP_OK;
 
-    if (action == "restart" || action == "hardreset") {
+    if (action == "sim-puk") {
+        esp_err_t err = idf_modem_request_sim_unlock(true);
+        success = err == ESP_OK;
+        message = success ? "PUK 解锁请求已提交，请查看 SIM 状态" : esp_err_to_name(err);
+        if (success) idf_log_line("网页已确认执行一次 SIM PUK 解锁");
+    } else if (action == "restart" || action == "hardreset") {
         bool hard = action == "hardreset";
         esp_err_t err = idf_modem_request_reset(hard);
         success = (err == ESP_OK);
@@ -1059,11 +1083,10 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
             message = resp.empty() ? esp_err_to_name(err) : resp;
         }
     } else if (action == "imei") {
-        std::string resp;
-        esp_err_t err = idf_modem_send_at("AT+CGSN", 3000, resp);
-        message = first_digits(resp);
-        success = (err == ESP_OK && !message.empty());
-        if (!success) message = resp.empty() ? esp_err_to_name(err) : resp;
+        std::string imei;
+        esp_err_t err = idf_modem_get_imei(imei);
+        success = err == ESP_OK;
+        message = success ? imei : std::string("无法读取模组 IMEI: ") + esp_err_to_name(err);
     } else {
         message = "未知操作: " + action;
     }
@@ -1290,6 +1313,21 @@ static void parse_sched_tasks_form(const IdfFormFields& fields,
     }
 }
 
+static void parse_sim_credentials_form(const IdfFormFields& fields,
+                                       IdfSimCredential items[IDF_MAX_SIM_CREDENTIALS])
+{
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        char key[20];
+        snprintf(key, sizeof(key), "sim%dIccid", i); items[i].iccid = field_text(fields, key);
+        snprintf(key, sizeof(key), "sim%dPin", i); items[i].pin = field_text(fields, key);
+        snprintf(key, sizeof(key), "sim%dPuk", i); items[i].puk = field_text(fields, key);
+        snprintf(key, sizeof(key), "sim%dPinMax", i); items[i].pinMaxAttempts = field_u8(fields, key, 1);
+        snprintf(key, sizeof(key), "sim%dPukMax", i); items[i].pukMaxAttempts = field_u8(fields, key, 1);
+        snprintf(key, sizeof(key), "sim%dResetPin", i); if (has_field(fields, key)) items[i].pinFailedAttempts = UINT8_MAX;
+        snprintf(key, sizeof(key), "sim%dResetPuk", i); if (has_field(fields, key)) items[i].pukFailedAttempts = UINT8_MAX;
+    }
+}
+
 static esp_err_t handle_save(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
@@ -1312,13 +1350,14 @@ static esp_err_t handle_save(httpd_req_t* req)
     const bool sim_form = has_field(fields, "simForm");
     const bool call_form = has_field(fields, "callForm");
     const bool mdns_form = has_field(fields, "mdnsForm");
+    const bool wifi_list_form = has_field(fields, "wifiListForm");
     const int form_count = (account_form ? 1 : 0) + (tz_form ? 1 : 0) +
                            (led_form ? 1 : 0) + (email_form ? 1 : 0) +
                            (push_form ? 1 : 0) + (filter_form ? 1 : 0) +
                            (rules_form ? 1 : 0) + (ka_form ? 1 : 0) +
                            (st_form ? 1 : 0) + (system_sched_form ? 1 : 0) +
                            (sim_form ? 1 : 0) + (call_form ? 1 : 0) +
-                           (mdns_form ? 1 : 0);
+                           (mdns_form ? 1 : 0) + (wifi_list_form ? 1 : 0);
     if (form_count != 1) {
         idf_log_line(form_count == 0 ? "网页保存请求缺少表单标记，已忽略"
                                      : "网页保存请求包含多个表单标记，已拒绝");
@@ -1356,9 +1395,36 @@ static esp_err_t handle_save(httpd_req_t* req)
     }
 
     if (mdns_form) {
+        // 规范化(转小写/剥离 .local/过滤非法字符)在 idf_config_save_mdns_host 内完成，
+        // 保存成功后 mDNS 应答任务 ≤1s 切换到新主机名，无需重启
         esp_err_t err = idf_config_save_mdns_host(field_text(fields, "mdnsHost"));
         if (err != ESP_OK) return fail(err);
         return ok("网页保存 mDNS 主机名");
+    }
+
+    if (wifi_list_form) {
+        // 历史 WiFi 整表保存：空 SSID 行=删除该槽位；已存网络密码留空=保持原密码。
+        // 只改列表不打断当前连接，掉线重连/重启后按新列表扫描选网
+        IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS];
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            char key[16];
+            snprintf(key, sizeof(key), "wifi%dSsid", i);
+            nets[i].ssid = field_text(fields, key);
+            snprintf(key, sizeof(key), "wifi%dPass", i);
+            nets[i].pass = field_text(fields, key);
+        }
+        uint8_t wifi_tx_power = field_u8(fields, "wifiTxPowerQuarterDbm", 34);
+        esp_err_t err = idf_config_save_wifi_networks(nets, true, wifi_tx_power);
+        if (err == ESP_ERR_INVALID_ARG) {
+            set_no_cache_headers(req);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "WiFi 网络或发射功率档位无效");
+            return ESP_OK;
+        }
+        if (err != ESP_OK) return fail(err);
+        esp_err_t apply_err = idf_wifi_set_tx_power(wifi_tx_power);
+        if (apply_err != ESP_OK) idf_logf("WiFi 功率已保存，立即应用失败: %s", esp_err_to_name(apply_err));
+        return ok("网页保存 WiFi 网络列表");
     }
 
     if (led_form) {
@@ -1470,21 +1536,40 @@ static esp_err_t handle_save(httpd_req_t* req)
 
     if (sim_form) {
         IdfSimSettingsView before = idf_config_get_sim_settings_view();
+        IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS];
+        parse_sim_credentials_form(fields, credentials);
         esp_err_t err = idf_config_save_sim(has_field(fields, "dataEnabled"),
                                             has_field(fields, "roamingEnabled"),
                                             field_text(fields, "apn"),
                                             field_text(fields, "operatorPlmn"),
-                                            field_text(fields, "phoneNumber"));
+                                            field_text(fields, "phoneNumber"),
+                                            credentials);
+        if (err == ESP_ERR_INVALID_ARG) {
+            set_no_cache_headers(req);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SIM ICCID/PIN/PUK 格式无效");
+            return ESP_OK;
+        }
         if (err != ESP_OK) return fail(err);
         IdfSimSettingsView after = idf_config_get_sim_settings_view();
         bool data_changed = before.dataEnabled != after.dataEnabled || before.apn != after.apn ||
                             before.roamingEnabled != after.roamingEnabled;
         bool operator_changed = before.operatorPlmn != after.operatorPlmn;
+        bool credentials_changed = false;
+        for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+            const IdfSimCredential& a = before.credentials[i];
+            const IdfSimCredential& b = after.credentials[i];
+            credentials_changed = credentials_changed || a.iccid != b.iccid || a.pin != b.pin ||
+                                  a.puk != b.puk || a.pinMaxAttempts != b.pinMaxAttempts ||
+                                  a.pukMaxAttempts != b.pukMaxAttempts ||
+                                  a.pinFailedAttempts != b.pinFailedAttempts ||
+                                  a.pukFailedAttempts != b.pukFailedAttempts;
+        }
 
         httpd_resp_set_type(req, "text/plain");
         set_no_cache_headers(req);
         httpd_resp_sendstr(req, "OK");
         idf_log_line("网页保存蜂窝设置");
+        if (credentials_changed) idf_modem_request_sim_unlock(false);
         if (!data_changed && !operator_changed) return ESP_OK;
 
         ModemApplyTaskArg* arg = new (std::nothrow) ModemApplyTaskArg();
@@ -1546,8 +1631,7 @@ static esp_err_t handle_import_config(httpd_req_t* req)
 
 static void restart_task(void*)
 {
-    // WiFi/恢复出厂保存会先回 HTTP 响应再重启；多 WiFi 全量保存后给 TCP flush 留足时间，
-    // 避免配置已写入但浏览器端只看到请求超时。
+    // 避免配置已写入但浏览器端只看到请求超时，先给 HTTP 响应留出刷新时间。
     vTaskDelay(pdMS_TO_TICKS(3000));
     // 计划内重启先给模组断电：保留"重启设备可救活已卡死模组"的原有语义，
     // 模组热启动快路径只留给崩溃/看门狗等意外复位
@@ -1595,6 +1679,7 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     bool preserve_blank_passes[IDF_MAX_WIFI_NETWORKS] = {};
     bool clear_passes[IDF_MAX_WIFI_NETWORKS] = {};
     int network_count = 0;
+    uint8_t wifi_tx_power = field_u8(fields, "wifiTxPowerQuarterDbm", 34);
 
     if (has_field(fields, "wifiCount")) {
         int requested = field_int(fields, "wifiCount", 0);
@@ -1609,6 +1694,10 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
             clear_passes[network_count] = has_field(fields, key);
             preserve_blank_passes[network_count] = true;
             if (!networks[network_count].ssid.empty()) ++network_count;
+        }
+        if (network_count > 0) {
+            ssid_s = networks[0].ssid;
+            pass_s = networks[0].pass;
         }
     } else {
         networks[0].ssid = ssid_s;
@@ -1627,7 +1716,12 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
         }
     }
 
-    if (idf_wifi_is_ap_mode() && !ssid_s.empty()) {
+    set_json_no_cache(req);
+    if (network_count <= 0 || ssid_s.empty()) {
+        std::string msg = "{\"success\":false,\"message\":\"请至少填写 1 个 WiFi 名称\"}";
+        return httpd_resp_send(req, msg.c_str(), msg.size());
+    }
+    if (idf_wifi_is_ap_mode()) {
         std::vector<IdfWifiNetwork> current = idf_config_get_wifi_networks();
         IdfWifiNetwork provision_networks[IDF_MAX_WIFI_NETWORKS];
         bool provision_preserve[IDF_MAX_WIFI_NETWORKS] = {};
@@ -1646,12 +1740,14 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
         esp_err_t err = idf_config_save_wifi_networks(provision_networks,
                                                       out_count,
                                                       provision_preserve,
-                                                      provision_clear);
-        set_json_no_cache(req);
+                                                      provision_clear,
+                                                      wifi_tx_power);
         if (err != ESP_OK) {
             std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
             return httpd_resp_send(req, msg.c_str(), msg.size());
         }
+        esp_err_t apply_err = idf_wifi_set_tx_power(wifi_tx_power);
+        if (apply_err != ESP_OK) idf_logf("WiFi 功率已保存，立即应用失败: %s", esp_err_to_name(apply_err));
         // 配网热点内：原地 APSTA 连接、不重启，配网页轮询 /apstatus 显示 IP，
         // 连上后由设备延时自动关闭热点(见 idf_wifi_provision_connect)
         idf_wifi_provision_connect(ssid_s, pass_s);
@@ -1660,14 +1756,16 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     }
 
     esp_err_t err = idf_config_save_wifi_networks(networks,
-                                                 network_count,
-                                                 preserve_blank_passes,
-                                                 clear_passes);
-    set_json_no_cache(req);
+                                                  network_count,
+                                                  preserve_blank_passes,
+                                                  clear_passes,
+                                                  wifi_tx_power);
     if (err != ESP_OK) {
         std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
+    esp_err_t apply_err = idf_wifi_set_tx_power(wifi_tx_power);
+    if (apply_err != ESP_OK) idf_logf("WiFi 功率已保存，立即应用失败: %s", esp_err_to_name(apply_err));
     idf_logf("WiFi 配置已保存: %d 个，设备即将重启", network_count);
     char message[96];
     snprintf(message, sizeof(message), "WiFi 已保存 %d 个，设备即将重启", network_count);
@@ -1829,11 +1927,17 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     size_t written = 0;
     char buf[1024];
     const size_t keep_tail = boundary_marker.size() + 8;
-    mbedtls_sha256_context sha_ctx;
+    // 使用通用 md API：IDF 6 / MbedTLS 4 已把旧 mbedtls_sha256_context 所在头移入 private
+    mbedtls_md_context_t sha_ctx;
     bool sha_active = !expected_sha256.empty();
     if (sha_active) {
-        mbedtls_sha256_init(&sha_ctx);
-        mbedtls_sha256_starts(&sha_ctx, 0);
+        mbedtls_md_init(&sha_ctx);
+        const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+        if (!info || mbedtls_md_setup(&sha_ctx, info, 0) != 0 || mbedtls_md_starts(&sha_ctx) != 0) {
+            mbedtls_md_free(&sha_ctx);
+            sha_active = false;
+            err = ESP_FAIL;
+        }
     }
 
     int timeouts = 0;
@@ -1876,9 +1980,9 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
             err = esp_ota_write(ota, pending.data(), writable);
             if (err == ESP_OK) {
                 if (sha_active) {
-                    mbedtls_sha256_update(&sha_ctx,
-                                          reinterpret_cast<const unsigned char*>(pending.data()),
-                                          writable);
+                    mbedtls_md_update(&sha_ctx,
+                                      reinterpret_cast<const unsigned char*>(pending.data()),
+                                      writable);
                 }
                 written += writable;
                 pending.erase(0, writable);
@@ -1899,9 +2003,9 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
                 }
                 if (err == ESP_OK) {
                     if (sha_active) {
-                        mbedtls_sha256_update(&sha_ctx,
-                                              reinterpret_cast<const unsigned char*>(pending.data()),
-                                              boundary);
+                        mbedtls_md_update(&sha_ctx,
+                                          reinterpret_cast<const unsigned char*>(pending.data()),
+                                          boundary);
                     }
                     written += boundary;
                 }
@@ -1913,14 +2017,17 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     if (err == ESP_OK && (!in_file || !saw_boundary || written == 0)) err = ESP_ERR_INVALID_SIZE;
     if (err == ESP_OK && sha_active) {
         unsigned char digest[32] = {};
-        mbedtls_sha256_finish(&sha_ctx, digest);
-        std::string actual = hex_lower(digest, sizeof(digest));
-        if (actual != expected_sha256) {
-            sha_mismatch = true;
-            err = ESP_ERR_INVALID_CRC;
+        if (mbedtls_md_finish(&sha_ctx, digest) != 0) {
+            err = ESP_FAIL;
+        } else {
+            std::string actual = hex_lower(digest, sizeof(digest));
+            if (actual != expected_sha256) {
+                sha_mismatch = true;
+                err = ESP_ERR_INVALID_CRC;
+            }
         }
     }
-    if (sha_active) mbedtls_sha256_free(&sha_ctx);
+    if (sha_active) mbedtls_md_free(&sha_ctx);
     if (err == ESP_OK) err = esp_ota_end(ota);
     else esp_ota_abort(ota);
     if (err == ESP_OK) err = esp_ota_set_boot_partition(part);
@@ -2283,11 +2390,42 @@ struct EsimTaskArg {
     std::string action;
     std::string identifier;
     std::string nickname;
+    bool allowMissingAdminProtocol = false;
+    LpaActivationCode activationCode;
 };
+
+static void lpa_job_set_phase(void*, const char* phase, const char* phase_message)
+{
+    if (!cell_job_lock()) return;
+    s_esim_job.installPhase = phase ? phase : "";
+    if (phase_message && *phase_message) s_esim_job.message = phase_message;
+    cell_job_unlock();
+}
+
+static esp_err_t lpa_job_wait_confirmation(void*, std::string& code, std::string& message)
+{
+    code.clear();
+    for (int i = 0; i < 600; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        bool received = false;
+        if (cell_job_lock()) {
+            if (s_esim_confirmation_submitted) {
+                code = std::move(s_esim_confirmation_code);
+                s_esim_confirmation_submitted = false;
+                received = true;
+            }
+            cell_job_unlock();
+        }
+        if (received) return ESP_OK;
+    }
+    message = "Confirmation Code 等待超时";
+    return ESP_ERR_TIMEOUT;
+}
 
 static std::string esim_action_label(const std::string& action)
 {
     if (action == "refresh") return "刷新 eSIM Profile";
+    if (action == "install-start") return "下载 eSIM Profile";
     if (action == "info") return "查询 eSIM 信息";
     if (action == "enable") return "启用 eSIM Profile";
     if (action == "disable") return "禁用 eSIM Profile";
@@ -2297,16 +2435,18 @@ static std::string esim_action_label(const std::string& action)
     return "eSIM 操作";
 }
 
-static void copy_esim_cache(std::string& eid,
+static bool copy_esim_state(WebAsyncJob& job,
+                            std::string& eid,
                             std::vector<IdfEsimProfile>& profiles,
                             uint32_t& updated_at)
 {
-    if (cell_job_lock()) {
-        eid = s_esim_cache.eid;
-        profiles = s_esim_cache.profiles;
-        updated_at = s_esim_cache.updatedAt;
-        cell_job_unlock();
-    }
+    if (!cell_job_lock()) return false;
+    job = s_esim_job;
+    eid = s_esim_cache.eid;
+    profiles = s_esim_cache.profiles;
+    updated_at = s_esim_cache.updatedAt;
+    cell_job_unlock();
+    return true;
 }
 
 static void append_esim_profile_json(std::string& body, const IdfEsimProfile& p)
@@ -2325,15 +2465,21 @@ static void append_esim_profile_json(std::string& body, const IdfEsimProfile& p)
 static void esim_task(void* arg_raw)
 {
     EsimTaskArg* arg = static_cast<EsimTaskArg*>(arg_raw);
-    std::string action = arg->action;
-    std::string identifier = arg->identifier;
-    std::string nickname = arg->nickname;
+    std::string action = std::move(arg->action);
+    std::string identifier = std::move(arg->identifier);
+    std::string nickname = std::move(arg->nickname);
+    bool allow_missing_admin_protocol = arg->allowMissingAdminProtocol;
+    LpaActivationCode activation_code = std::move(arg->activationCode);
     delete arg;
 
+    // 安装协议在后台执行；请求线程只负责入队和状态返回。
     if (cell_job_lock()) {
         s_esim_job.queued = false;
         s_esim_job.running = true;
-        s_esim_job.message = esim_action_label(action) + "执行中";
+        s_esim_job.installPhase = action == "install-start" ? "queued" : "";
+        s_esim_job.message = action == "install-start"
+            ? "下载 eSIM Profile 认证中"
+            : esim_action_label(action) + "执行中";
         cell_job_unlock();
     }
 
@@ -2342,7 +2488,34 @@ static void esim_task(void* arg_raw)
     std::vector<IdfEsimProfile> profiles;
     esp_err_t err = ESP_ERR_INVALID_ARG;
     bool cache_eid_only = false;
-    if (action == "refresh") {
+    bool cache_ready = false;
+    if (action == "install-start") {
+        LpaDownloadObserver observer;
+        observer.allow_missing_admin_protocol = allow_missing_admin_protocol;
+        observer.set_phase = lpa_job_set_phase;
+        observer.wait_confirmation_code = lpa_job_wait_confirmation;
+        LpaDownloadStats stats;
+        err = idf_lpa_run_profile_download(activation_code, observer, stats, message);
+        // 仅输出资源计数，便于真机比较不同 BPP；不包含任何下载凭据或协议载荷。
+        idf_logf("eSIM下载资源汇总: result=%s bppEncodedBytes=%u bppDecodedBytes=%u "
+                 "freeHeapAtStart=%u minimumFreeHeap=%u largestFreeBlock=%u freeHeapAtEnd=%u",
+                 err == ESP_OK ? "success" : esp_err_to_name(err),
+                 static_cast<unsigned>(stats.bppEncodedBytes),
+                 static_cast<unsigned>(stats.bppDecodedBytes),
+                 static_cast<unsigned>(stats.freeHeapAtStart),
+                 static_cast<unsigned>(stats.minimumFreeHeap),
+                 static_cast<unsigned>(stats.largestFreeBlock),
+                 static_cast<unsigned>(stats.freeHeapAtEnd));
+        if (err == ESP_OK) {
+            std::string refresh_message;
+            err = idf_esim_list_profiles(profiles, eid, refresh_message);
+            if (err != ESP_OK) {
+                message = "Profile 已写入，但刷新列表失败：" + refresh_message;
+            } else {
+                cache_ready = true;
+            }
+        }
+    } else if (action == "refresh") {
         err = idf_esim_list_profiles(profiles, eid, message);
     } else if (action == "info") {
         err = idf_esim_get_eid(eid, message);
@@ -2362,12 +2535,12 @@ static void esim_task(void* arg_raw)
     }
 
     bool ok = (err == ESP_OK);
+    // 认证阶段不修改 Profile 列表；只有既有 Profile 管理操作才更新卡侧缓存。
     // 启用/切换/禁用改变当前生效的卡：让模组重读号码/ICCID/运营商，避免概览沿用旧卡缓存
     bool sim_changed = ok && (action == "enable" || action == "switch" || action == "disable");
     if (sim_changed) {
         idf_modem_invalidate_sim_identity();
     }
-    bool cache_ready = false;
     if (ok && (action == "delete" || action == "nickname")) {
         // 不影响当前 UICC 会话的操作：立即回读一次列表刷新缓存
         std::string refresh_msg;
@@ -2380,7 +2553,7 @@ static void esim_task(void* arg_raw)
         } else {
             message += "；操作后刷新列表失败: " + refresh_msg;
         }
-    } else if (ok && !sim_changed) {
+    } else if (ok && action != "install-start" && !sim_changed) {
         cache_ready = true;
     }
     // sim_changed：切卡成功即触发模组软重启复位 UICC(issue #17)，此刻回读列表
@@ -2389,8 +2562,11 @@ static void esim_task(void* arg_raw)
     std::string final_message = message.empty()
         ? (ok ? "eSIM 操作已完成" : "eSIM 操作失败")
         : message;
+    activation_code.clear_sensitive();
     if (cell_job_lock(portMAX_DELAY)) {
+        bool eid_changed = !eid.empty() && !s_esim_cache.eid.empty() && eid != s_esim_cache.eid;
         if (cache_eid_only) {
+            if (eid_changed) s_esim_cache.profiles.clear();
             s_esim_cache.eid = eid;
             s_esim_cache.updatedAt = static_cast<uint32_t>(time(nullptr));
         } else if (cache_ready) {
@@ -2398,16 +2574,21 @@ static void esim_task(void* arg_raw)
             s_esim_cache.profiles = profiles;
             s_esim_cache.updatedAt = static_cast<uint32_t>(time(nullptr));
         } else if (ok) {
-            // 切卡/启停成功，模组正在重启附着新卡：清掉旧列表而不是留着过期状态
-            // 误导用户重复操作，待模组就绪后由用户刷新
+            // 启用、禁用或切换 Profile 仍在同一张 eUICC 上，只清当前 Profile 列表。
             s_esim_cache.profiles.clear();
             s_esim_cache.updatedAt = static_cast<uint32_t>(time(nullptr));
         }
+        // 安装认证阶段不修改 Profile/EID 缓存；能力仅在该下载任务的 preflight 中读取。
         s_esim_job.running = false;
         s_esim_job.queued = false;
         s_esim_job.done = true;
         s_esim_job.success = ok;
+        s_esim_job.installPhase = action == "install-start" ? (ok ? "complete" : "failed") : "";
         s_esim_job.message = final_message;
+        if (action == "install-start") {
+            idf_lpa_clear_sensitive(s_esim_confirmation_code);
+            s_esim_confirmation_submitted = false;
+        }
         cell_job_unlock();
     }
     idf_logf("%s: %s", esim_action_label(action).c_str(), ok ? "完成" : final_message.c_str());
@@ -2418,7 +2599,9 @@ static bool start_esim_job(const std::string& action,
                            const std::string& identifier,
                            const std::string& nickname,
                            std::string& message,
-                           bool& already_running)
+                           bool& already_running,
+                           bool allow_missing_admin_protocol,
+                           LpaActivationCode activation_code)
 {
     already_running = false;
     if (!cell_job_lock()) {
@@ -2436,15 +2619,28 @@ static bool start_esim_job(const std::string& action,
     s_esim_job.done = false;
     s_esim_job.success = false;
     s_esim_job.action = action;
-    s_esim_job.message = esim_action_label(action) + "已排队";
+    if (action == "install-start") {
+        idf_lpa_clear_sensitive(s_esim_confirmation_code);
+        s_esim_confirmation_submitted = false;
+        s_esim_job.installPhase = "queued";
+        s_esim_job.message = "下载 eSIM Profile 已排队";
+        s_esim_job.installHost = activation_code.smdpHost;
+        s_esim_job.installMatchingIdMasked = idf_lpa_mask_matching_id(activation_code.matchingId);
+    } else {
+        s_esim_job.message = esim_action_label(action) + "已排队";
+    }
     cell_job_unlock();
 
     EsimTaskArg* arg = new (std::nothrow) EsimTaskArg();
     if (!arg) {
         if (cell_job_lock(portMAX_DELAY)) {
+            idf_lpa_clear_sensitive(s_esim_confirmation_code);
+            s_esim_confirmation_submitted = false;
             s_esim_job.queued = false;
             s_esim_job.done = true;
             s_esim_job.success = false;
+            s_esim_job.installHost.clear();
+            s_esim_job.installMatchingIdMasked.clear();
             s_esim_job.message = "创建 eSIM 任务失败：内存不足";
             cell_job_unlock();
         }
@@ -2454,19 +2650,27 @@ static bool start_esim_job(const std::string& action,
     arg->action = action;
     arg->identifier = identifier;
     arg->nickname = nickname;
+    arg->allowMissingAdminProtocol = allow_missing_admin_protocol;
+    arg->activationCode = std::move(activation_code);
     if (xTaskCreate(esim_task, "idf_esim", 8192, arg, 3, nullptr) != pdPASS) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
+            idf_lpa_clear_sensitive(s_esim_confirmation_code);
+            s_esim_confirmation_submitted = false;
             s_esim_job.queued = false;
             s_esim_job.done = true;
             s_esim_job.success = false;
+            s_esim_job.installHost.clear();
+            s_esim_job.installMatchingIdMasked.clear();
             s_esim_job.message = "创建 eSIM 任务失败";
             cell_job_unlock();
         }
         message = "创建 eSIM 任务失败";
         return false;
     }
-    message = esim_action_label(action) + "已排队";
+    message = action == "install-start"
+        ? "下载 eSIM Profile 已排队"
+        : esim_action_label(action) + "已排队";
     idf_logf("%s已入队", esim_action_label(action).c_str());
     return true;
 }
@@ -3329,14 +3533,13 @@ static esp_err_t handle_esim(httpd_req_t* req)
         std::string eid;
         std::vector<IdfEsimProfile> profiles;
         uint32_t updated_at = 0;
-        if (cell_job_lock()) {
-            job = s_esim_job;
-            cell_job_unlock();
+        if (!copy_esim_state(job, eid, profiles, updated_at)) {
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"eSIM 状态暂不可用\"}");
         }
-        copy_esim_cache(eid, profiles, updated_at);
         IdfConfigStatusView cfg = idf_config_get_status_view();
         std::string body;
-        body.reserve(760 + profiles.size() * 260);
+        body.reserve(1020 + profiles.size() * 260);
         char buf[192];
         snprintf(buf, sizeof(buf),
                  "{\"jobQueued\":%s,\"jobRunning\":%s,\"jobDone\":%s,"
@@ -3356,6 +3559,11 @@ static esp_err_t handle_esim(httpd_req_t* req)
         json_prop(body, "updatedLocal", format_epoch_local(updated_at, cfg.tzOffsetMin)); body += ",";
         json_prop(body, "jobMessage", job.message); body += ",";
         json_prop(body, "message", job.message); body += ",";
+        json_prop(body, "installPhase", job.installPhase); body += ",";
+        if (job.action == "install-start") {
+            json_prop(body, "installHost", job.installHost); body += ",";
+            json_prop(body, "installMatchingIdMasked", job.installMatchingIdMasked); body += ",";
+        }
         body += "\"profiles\":[";
         for (size_t i = 0; i < profiles.size(); ++i) {
             if (i) body += ",";
@@ -3368,33 +3576,121 @@ static esp_err_t handle_esim(httpd_req_t* req)
     if (req->method != HTTP_POST) {
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"eSIM 操作需要 POST\"}");
     }
-    if (!(action == "refresh" || action == "info" || action == "enable" || action == "disable" ||
-          action == "delete" ||
-          action == "nickname" || action == "switch")) {
+    if (!(action == "refresh" || action == "info" ||
+          action == "enable" || action == "disable" || action == "delete" ||
+          action == "nickname" || action == "switch" || action == "install-start" ||
+          action == "install-confirmation-code")) {
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"未知 eSIM 操作\"}");
     }
 
+    constexpr size_t kInstallBodyMax = 2048;
     std::string raw;
-    if (read_body(req, raw, 768) != ESP_OK) return ESP_OK;
+    if (read_body(req, raw, action == "install-start" ? kInstallBodyMax : 768) != ESP_OK) {
+        if (action == "install-start" || action == "install-confirmation-code") {
+            idf_lpa_clear_sensitive(raw);
+        }
+        return ESP_OK;
+    }
     IdfFormFields fields = parse_urlencoded(raw);
+    LpaActivationCode activation_code;
+    bool allow_missing_admin_protocol = false;
+    if (action == "install-start") {
+        // 安装请求只接受 activationCode 和可选的本次兼容参数，避免
+        // 请求语义含糊或未来协议误把未知字段当成扩展参数。
+        const std::string* compat = find_field(fields, "es9CompatMode");
+        const bool only_activation = fields.size() == 1U &&
+                                     field_count(fields, "activationCode") == 1U;
+        const bool activation_with_compat = fields.size() == 2U &&
+                                            field_count(fields, "activationCode") == 1U &&
+                                            field_count(fields, "es9CompatMode") == 1U &&
+                                            compat && *compat == "1";
+        if (!only_activation && !activation_with_compat) {
+            clear_sensitive_form_values(fields);
+            idf_lpa_clear_sensitive(raw);
+            return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Activation Code 参数无效\"}");
+        }
+        allow_missing_admin_protocol = activation_with_compat;
+        std::string parse_message;
+        const std::string* input = find_field(fields, "activationCode");
+        if (!input || !idf_lpa_parse_activation_code(*input, activation_code, parse_message)) {
+            clear_sensitive_form_values(fields);
+            idf_lpa_clear_sensitive(raw);
+            std::string body = "{\"success\":false,";
+            json_prop(body, "message", parse_message.empty() ? "Activation Code 无效" : parse_message);
+            body += "}";
+            return httpd_resp_send(req, body.c_str(), body.size());
+        }
+    }
+
+    if (action == "install-start" || action == "install-confirmation-code") {
+        idf_lpa_clear_sensitive(raw);
+    }
+
     std::string identifier;
     std::string nickname;
     if (const std::string* v = find_field(fields, "id")) identifier = idf_util_trim_copy(*v);
     if (const std::string* v = find_field(fields, "nickname")) nickname = idf_util_trim_copy(*v);
-    if (action != "refresh" && action != "info" && identifier.empty()) {
+    if (action != "install-start" && action != "install-confirmation-code") {
+        clear_sensitive_form_values(fields);
+    }
+    if (action != "refresh" && action != "info" &&
+        action != "install-start" && action != "install-confirmation-code" &&
+        identifier.empty()) {
+        clear_sensitive_form_values(fields);
+        idf_lpa_clear_sensitive(raw);
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Profile 标识为空\"}");
     }
     if (action == "nickname" && nickname.size() > 64) {
+        clear_sensitive_form_values(fields);
+        idf_lpa_clear_sensitive(raw);
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"昵称最长 64 字节\"}");
     }
 
+    if (action == "install-confirmation-code") {
+        const std::string* code = find_field(fields, "confirmationCode");
+        bool valid = fields.size() == 1U && field_count(fields, "confirmationCode") == 1U &&
+                     code && !code->empty() && code->size() <= 64U;
+        if (valid) {
+            for (unsigned char ch : *code) {
+                if (ch < 0x21U || ch > 0x7EU) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        bool accepted = false;
+        if (valid && cell_job_lock()) {
+            if (s_esim_job.action == "install-start" && s_esim_job.running &&
+                !s_esim_job.done && s_esim_job.installPhase == "waiting_confirmation" &&
+                !s_esim_confirmation_submitted) {
+                s_esim_confirmation_code = *code;
+                s_esim_confirmation_submitted = true;
+                accepted = true;
+            }
+            cell_job_unlock();
+        }
+        clear_sensitive_form_values(fields);
+        idf_lpa_clear_sensitive(raw);
+        return httpd_resp_sendstr(req, accepted
+            ? "{\"success\":true,\"message\":\"Confirmation Code 已提交\"}"
+            : "{\"success\":false,\"message\":\"当前未处于 Confirmation Code 等待阶段\"}");
+    }
     std::string message;
     bool already_running = false;
-    bool ok = start_esim_job(action, identifier, nickname, message, already_running);
+    bool ok = start_esim_job(action, identifier, nickname, message, already_running,
+                             allow_missing_admin_protocol, std::move(activation_code));
+    // install-start 的 Activation Code 在解析字段中仍可能存在；先清理整个 form，
+    // 再让 LpaActivationCode 的移动对象独立负责剩余短期字段。
+    clear_sensitive_form_values(fields);
+    idf_lpa_clear_sensitive(raw);
+    bool accepted = ok || already_running;
+    // Activation Code 属于用户短期输入；安装请求撞上已有任务时不能伪装成已入队，
+    // 也不能让前端在未接受时清空输入。
+    if (action == "install-start" && already_running && !ok) accepted = false;
     std::string body = "{\"success\":";
-    body += (ok || already_running) ? "true" : "false";
+    body += accepted ? "true" : "false";
     body += ",\"queued\":";
-    body += (ok || already_running) ? "true" : "false";
+    body += accepted ? "true" : "false";
     body += ",";
     json_prop(body, "message", message);
     body += "}";
@@ -3721,7 +4017,7 @@ esp_err_t idf_web_start(void)
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.lru_purge_enable = true;
     // 多方法接口使用 HTTP_ANY 单路由，实际路由约 37 个；保留余量同时减少 HTTPD 路由表内存
-    config.max_uri_handlers = 50;
+    config.max_uri_handlers = 48;
     config.stack_size = 8192;
     // HTTPD 内部预留 3 个 socket；此外本固件常驻 mDNS/DNS/SNTP，推送/SMTP
     // 也需要余量。已有 build/sdkconfig 可能仍是旧值(如 LWIP=10)，硬设 13

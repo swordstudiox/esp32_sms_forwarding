@@ -1,0 +1,5 @@
+CompileFlags:
+  CompilationDatabase: build/idf6
+  Remove:
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion

@@ -1,7 +1,7 @@
 # SMS Forwarding ESP-IDF 固件
 
 <p align="center">
-  <a href="https://github.com/MineSunshineone/sms_forwarding/actions/workflows/build.yml"><img alt="CI" src="https://github.com/MineSunshineone/sms_forwarding/actions/workflows/build.yml/badge.svg" /></a>
+  <a href="https://github.com/swordstudiox/esp32_sms_forwarding/actions/workflows/build.yml"><img alt="CI" src="https://github.com/swordstudiox/esp32_sms_forwarding/actions/workflows/build.yml/badge.svg" /></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
   <a href="https://linux.do"><img alt="LINUX DO" src="https://img.shields.io/badge/LINUX-DO-FFB003.svg?logo=data:image/svg%2bxml;base64,DQo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiPjxwYXRoIGQ9Ik00Ni44Mi0uMDU1aDYuMjVxMjMuOTY5IDIuMDYyIDM4IDIxLjQyNmM1LjI1OCA3LjY3NiA4LjIxNSAxNi4xNTYgOC44NzUgMjUuNDV2Ni4yNXEtMi4wNjQgMjMuOTY4LTIxLjQzIDM4LTExLjUxMiA3Ljg4NS0yNS40NDUgOC44NzRoLTYuMjVxLTIzLjk3LTIuMDY0LTM4LjAwNC0yMS40M1EuOTcxIDY3LjA1Ni0uMDU0IDUzLjE4di02LjQ3M0MxLjM2MiAzMC43ODEgOC41MDMgMTguMTQ4IDIxLjM3IDguODE3IDI5LjA0NyAzLjU2MiAzNy41MjcuNjA0IDQ2LjgyMS0uMDU2IiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZWNlY2VjO2ZpbGwtb3BhY2l0eToxIi8+PHBhdGggZD0iTTQ3LjI2NiAyLjk1N3EyMi41My0uNjUgMzcuNzc3IDE1LjczOGE0OS43IDQ5LjcgMCAwIDEgNi44NjcgMTAuMTU3cS00MS45NjQuMjIyLTgzLjkzIDAgOS43NS0xOC42MTYgMzAuMDI0LTI0LjM4N2E2MSA2MSAwIDAgMSA5LjI2Mi0xLjUwOCIgc3R5bGU9InN0cm9rZTpub25lO2ZpbGwtcnVsZTpldmVub2RkO2ZpbGw6IzE5MTkxOTtmaWxsLW9wYWNpdHk6MSIvPjxwYXRoIGQ9Ik03Ljk4IDcwLjkyNmMyNy45NzctLjAzNSA1NS45NTQgMCA4My45My4xMTNRODMuNDI2IDg3LjQ3MyA2Ni4xMyA5NC4wODZxLTE4LjgxIDYuNTQ0LTM2LjgzMi0xLjg5OC0xNC4yMDMtNy4wOS0yMS4zMTctMjEuMjYyIiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZjlhZjAwO2ZpbGwtb3BhY2l0eToxIi8+PC9zdmc+" /></a>
 </p>
@@ -90,7 +90,8 @@ Web UI 提供独立的定时任务页，既能做 SIM 保号，也能做系统�
 
 ### Web 管理
 
-- WiFi 配网：支持最多 5 个已知 WiFi 网络，启动/重连时扫描当前环境并优先连接信号最好的已知网络；正常连接后可通过 IP 或可配置的 `<主机名>.local` 访问。
+- WiFi 配网：支持首次 SoftAP 配网，正常连接后可通过 IP 或 `sms.local` 访问（mDNS 主机名可在系统设置中自定义，多设备可各用一个 `xxx.local`）。
+- 历史 WiFi：最多保存 5 组网络，成功连接过的网络自动加入列表（同手机）；连接前先扫描并自动接入在场且信号最好的一组（多地点部署免等逐组超时），列表可在“网络设置”中增删、SSID 支持从扫描结果下拉选择。
 - 账号密码：Web 管理账号可单独保存。
 - 时间设置：NTP 服务器和时区可配置。
 - 蜂窝设置：蜂窝数据开关、APN、运营商 PLMN 锁定可配置。
@@ -105,7 +106,7 @@ Web UI 提供独立的定时任务页，既能做 SIM 保号，也能做系统�
 
 ### 原生 ESP-IDF 固件
 
-- 基于 ESP-IDF 5.x，目标芯片为 ESP32-C3。
+- 基于 ESP-IDF 6.0.2，目标芯片为 ESP32-C3。
 - 使用组件化结构拆分配置、WiFi、Web、模组、短信、推送、日志和收件箱。
 - 通过 CI 持续构建，减少“本地能编过、换环境不行”的问题。
 - Web UI 使用 `code/web_src/` 维护源码，再打包为 gzip 静态资源链接进固件。
@@ -136,7 +137,7 @@ Web UI 提供独立的定时任务页，既能做 SIM 保号，也能做系统�
 ### Web 管理与维护
 
 - Web UI 覆盖系统概览、转发配置、短信收发、定时任务、诊断控制、日志查看和 OTA。
-- 支持 SoftAP 配网、已知 WiFi 列表扫描选优接入、可配置 mDNS 主机名（默认 `sms.local`）、NTP 时间同步、AT 终端和运行状态查看。
+- 支持 SoftAP 配网、mDNS 域名（默认 `sms.local`，主机名可自定义）、NTP 时间同步、AT 终端和运行状态查看。
 - 日志进入 120 行环形缓冲，便于无串口时从 Web 排障。
 - OTA 双分区升级，配合崩溃转储分区，方便远程升级和异常分析。
 
@@ -195,13 +196,13 @@ Web 侧数据流：
 | `smsdata` | 640KB | 短信、收件箱等本地数据，使用 NVS 磨损均衡与掉电原子写入 |
 | `coredump` | 64KB | 崩溃转储，便于定位无人值守设备的异常 |
 
-`app0`/`app1` 保留双 OTA 槽位，每个槽位 1.625MB。当前固件大小约 1.24MB，单槽仍有约 24% 余量，可继续容纳后续 eSIM、诊断和 UI 功能。`smsdata` 单独放大，避免短信留存和普通配置共用很小的 NVS 空间。
+`app0`/`app1` 保留双 OTA 槽位，每个槽位 1.625MiB。ESP-IDF 6.0.2 构建的当前固件约 1.22MiB，单槽剩余约 25%（约 417KiB），可继续容纳后续 eSIM、诊断和 UI 功能。`smsdata` 单独放大，避免短信留存和普通配置共用很小的 NVS 空间。
 
 ## 体积与内存优化
 
 - 编译使用 `-Os` 尺寸优化，并减少断言字符串带来的 rodata 占用。
 - 关闭项目不使用的 IPv6、termios、WiFi NVS 等能力，减少 flash 和 RAM 占用。
-- WiFi 收发路径、FreeRTOS 与 ringbuf 部分函数放回 flash，释放 ESP32-C3 紧张的 IRAM。
+- WiFi 收发路径放回 flash；FreeRTOS 与 ring buffer 沿用 IDF 6 的默认 flash 放置行为，释放 ESP32-C3 紧张的 IRAM。
 - TLS 使用动态缓冲和会话后释放策略，空闲期减少堆占用。
 - socket 上限提高到 20，适配多浏览器标签页、mDNS、SNTP、推送和 SMTP 并存的场景。
 - SNTP 配置主服务器和兜底服务器，单个 NTP 不可达时不影响时间同步。
@@ -266,10 +267,10 @@ start preview\index.html
 已经安装 Python/esptool 的用户，也可以直接用命令行刷完整包：
 
 ```powershell
-esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 sms_forwarder_full_v1.0.9-fork.4.bin
+esptool --chip esp32c3 -p COM5 -b 460800 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 4MB 0x0 sms_forwarder_full_v*.bin
 ```
 
-其中 `COM5` 和文件名按实际情况替换。`esptool.py` 是电脑端刷写工具，不在固件里；没有 Python 环境时请优先使用上面的 GUI 工具。
+其中 `COM5` 和文件名按实际情况替换。`esptool` 是电脑端刷写工具，不在固件里；没有 Python 环境时请优先使用上面的 GUI 工具。
 
 ### 后续 OTA 升级
 
@@ -285,14 +286,7 @@ esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_
 
 ### 首次访问 Web UI
 
-首次启动时设备会读取已知 WiFi 网络列表（最多 5 个），先扫描当前环境，匹配已保存 SSID，并优先连接当前 RSSI 最好的已知网络。
-
-- 没有任何 WiFi 配置时，设备会立即开启开放配网热点 `SMS-Forwarder-XXXX`。
-- 已有 WiFi 配置但开机 60 秒仍未获得 IP 时，设备会开启 10 分钟临时配网热点；这适合换路由器、密码变更、设备搬到新环境且没有外露 BOOT 按键的救援场景。
-- 正常运行中如果 WiFi 掉线，设备不会自动打开无密码配网热点，而是周期扫描已知网络并自动连回；需要重新配网时可断电重启，等待 60 秒救援热点出现。
-- 如果硬件有可用 BOOT 键，长按约 5 秒仍可手动开启配网热点。
-
-连接热点后访问 `http://192.168.1.1` 配网；设备连上路由器后，可通过串口日志里的 IP 地址或默认 `http://sms.local` 打开 Web UI。主机名可在“系统设置 → 局域网域名”中修改，多台设备请设置不同主机名。
+首次启动时设备会优先连接已保存 WiFi；如果没有配置或连接失败，会开启开放热点 `SMS-Forwarder-XXXX`。连接热点后访问 `http://192.168.1.1` 配网；设备连上路由器后，可通过串口日志里的 IP 地址或 `http://sms.local` 打开 Web UI（主机名可在“系统设置 → 局域网域名”中修改，多台设备请设置不同主机名）。
 
 默认账号密码为 `admin` / `admin123`，首次使用请立即修改。
 
@@ -304,7 +298,7 @@ esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_
 - ESP32-C3 开发板或 ESP32-C3 Super Mini。
 - ML307 系列 4G/LTE 模组。
 - USB 数据线和对应串口驱动。
-- ESP-IDF 5.5.4。仓库脚本默认查找 `E:\Espressif\esp-idf-v5.5.4`，也可以通过 `IDF_PATH` 和 `IDF_TOOLS_PATH` 环境变量指定自己的安装位置。
+- ESP-IDF 6.0.2。仓库脚本默认查找 `E:\Espressif\esp-idf-v6.0.2`，也可以通过 `IDF_PATH` 和 `IDF_TOOLS_PATH` 环境变量指定自己的安装位置。
 
 确认串口号：
 
@@ -315,11 +309,11 @@ Get-CimInstance Win32_SerialPort | Select-Object DeviceID,Description
 拉取并进入项目：
 
 ```powershell
-git clone https://github.com/MineSunshineone/sms_forwarding.git
-cd sms_forwarding
+git clone https://github.com/swordstudiox/esp32_sms_forwarding.git
+cd esp32_sms_forwarding
 ```
 
-仓库提供了 ESP-IDF 封装脚本，会自动加载 ESP-IDF 环境，并把构建产物放在 `build/idf`，把 `sdkconfig` 放在 `build/sdkconfig`：
+仓库提供了 ESP-IDF 封装脚本，会自动加载 ESP-IDF 环境，并把构建产物放在 `build/idf6`，把配置放在 `build/sdkconfig.idf6`：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 build
@@ -346,7 +340,7 @@ powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 
 `monitor` 中可以看到 WiFi 连接、模组初始化、短信接收、推送、Web 访问和崩溃原因等日志。退出 monitor 通常使用 `Ctrl+]`。
 
-CI 使用 `.github/workflows/build.yml` 构建 ESP-IDF 固件，日常本地开发建议仍使用 `tools\idf.ps1`，这样构建目录和配置文件位置保持一致。
+CI 使用固定的 ESP-IDF 6.0.2 环境，通过 `.github/workflows/build.yml` 构建固件；日常本地开发建议仍使用 `tools\idf.ps1`，这样 SDK 版本、构建目录和配置文件位置保持一致。
 
 ## Bark 推送
 
@@ -365,7 +359,7 @@ CI 使用 `.github/workflows/build.yml` 构建 ESP-IDF 固件，日常本地开�
 #define WIFI_PASS "your-password"
 ```
 
-出厂 seed 会作为第一个已知 WiFi 的初始兜底配置；更多网络可在 Web UI 的“已知 WiFi 网络”里保存。也可以留空，完全走 Web 配网。
+也可以留空，完全走 Web 配网。
 
 ## 硬件接线
 

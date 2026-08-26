@@ -54,6 +54,11 @@
       }
       return html;
     }
+    function buildWifiTxPowerOptions(current) {
+      var levels = [[8,'2'],[20,'5'],[28,'7'],[34,'8.5（SuperMini 推荐）'],[44,'11'],[52,'13'],[56,'14'],[60,'15'],[66,'16.5'],[72,'18'],[80,'20']];
+      current = Number(current) || 34;
+      return levels.map(function(x){ return '<option value="' + x[0] + '"' + (x[0] === current ? ' selected' : '') + '>' + x[1] + ' dBm</option>'; }).join('');
+    }
     function pushTypeOptions(type) {
       var opts = [
         [1,'POST JSON（通用格式）'], [2,'Bark（iOS推送）'], [3,'GET请求（参数在URL中）'], [4,'钉钉机器人'],
@@ -97,6 +102,23 @@
       if (redacted && set) {
         html += '<label class="schedule-switch" id="' + key + 'ClearWrap' + idx + '" style="margin-top:6px;"><input type="checkbox" name="' + name + 'Clear"> 清除已保存参数</label>';
         html += '<p class="form-hint" id="' + key + 'SavedHint' + idx + '">已保存，留空不修改；填写新值会覆盖。</p>';
+      }
+      return html;
+    }
+    function buildSimCredentials(items) {
+      items = items || [];
+      var html = '';
+      for (var i = 0; i < 5; i++) {
+        var item = items[i] || {}, idx = String(i);
+        html += '<div class="sim-credential">';
+        html += '<div class="form-group"><label>ICCID ' + (i + 1) + '</label><input class="form-input" name="sim' + idx + 'Iccid" inputmode="numeric" maxlength="22" value="' + htmlEsc(item.iccid || '') + '" placeholder="完整 ICCID；留空删除本行"></div>';
+        html += '<div class="sim-credential-grid">';
+        html += '<div class="form-group"><label>PIN</label><input class="form-input" type="password" name="sim' + idx + 'Pin" inputmode="numeric" minlength="4" maxlength="8" autocomplete="new-password" placeholder="' + (item.pinSet ? '已保存，留空不修改' : '4–8 位数字') + '"></div>';
+        html += '<div class="form-group"><label>PIN 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PinMax" min="1" max="2" value="' + (item.pinMax || 1) + '"></div>';
+        html += '<div class="form-group"><label>PUK</label><input class="form-input" type="password" name="sim' + idx + 'Puk" inputmode="numeric" minlength="8" maxlength="8" autocomplete="new-password" placeholder="' + (item.pukSet ? '已保存，留空不修改' : '8 位数字') + '"></div>';
+        html += '<div class="form-group"><label>PUK 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PukMax" min="1" max="5" value="' + (item.pukMax || 1) + '"></div>';
+        html += '</div><p class="form-hint">失败计数：PIN ' + (item.pinFailed || 0) + '/' + (item.pinMax || 1) + '，PUK ' + (item.pukFailed || 0) + '/' + (item.pukMax || 1) + '。修改对应凭据会清零该计数。</p>';
+        html += '<div class="btn-row"><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPin"> 保存时重置 PIN 计数</label><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPuk"> 保存时重置 PUK 计数</label></div></div>';
       }
       return html;
     }
@@ -162,6 +184,7 @@
         DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
         APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
         OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),
+        WIFI_NETWORKS: buildWifiNetworks(c.wifiNetworks), WIFI_TX_POWER_OPTIONS: buildWifiTxPowerOptions(c.wifiTxPowerQuarterDbm), SIM_CREDENTIALS: buildSimCredentials(c.simCredentials),
         NETLED_CHECKED: checked(c.netLedEnabled !== false), CALLNOTIFY_CHECKED: checked(c.callNotifyEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
       };
       return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){ return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m; });
@@ -198,7 +221,7 @@
       if (name === 'inbox') loadMessages();
       if (name === 'keepalive' || name === 'diagnose') kaLoadStatus();
       if (name === 'keepalive') stLoadStatus();
-      if (name === 'sim') { wifiPrefill(); esimLoadStatus(); }
+      if (name === 'sim') { wifiPrefill(); esimLoadStatus(); loadStatus(); startStatusPoll(); }
       if (name === 'push') { for (var i = 0; i < 5; i++) { toggleChannel(i); updateTypeHint(i); } setupChannels(); parseFwdRules(); renderRules(); }
       if (name === 'atterm') bindAtTerminal();
     }
@@ -518,11 +541,6 @@
         }
       }
     }
-    document.addEventListener('DOMContentLoaded', function() {
-      for (var i = 0; i < 5; i++) { toggleChannel(i); updateTypeHint(i); }
-      setupChannels();
-    });
-
     // ---- SMTP Test (form current values; empty password uses saved) ----
     var smtpTestTimer = null, smtpTestBtnEl = null;
     function smtpTestDone() {
@@ -726,22 +744,28 @@
       }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;});
     }
 
-    // ---- SIM Own Number ----
-    function writeOwnNumber(){
-      var input=document.querySelector('[name="phoneNumber"]');
-      var r=document.getElementById('writeOwnNumberResult');
-      if(!input||!r)return;
-      var phone=(input.value||'').trim();
-      if(!phone){r.className='result-box result-error';r.textContent='请先填写本机号码';return;}
-      r.className='result-box result-loading';r.textContent='正在写入 SIM Own Number 电话本...';
-      csrfFetch('/modem?action=write_own_number&phone='+encodeURIComponent(phone),{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
-        r.className='result-box '+(d.success?'result-success':'result-error');
-        r.textContent=d.message|| (d.success?'写入成功':'写入失败');
-        if(d.success){
-          ensureConfig(true).catch(function(){ return null; });
-          if(panelActive('overview')) loadStatus(true);
-        }
-      }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;});
+    function writeOwnNumber() {
+      var input = document.querySelector('[name="phoneNumber"]');
+      var r = document.getElementById('writeOwnNumberResult');
+      if (!input || !r) return;
+      var phone = (input.value || '').trim();
+      if (!phone) {
+        r.className = 'result-box result-error';
+        r.textContent = '请先填写本机号码';
+        return;
+      }
+      r.className = 'result-box result-loading';
+      r.textContent = '正在写入 SIM Own Number 电话本...';
+      csrfFetch('/modem?action=write_own_number&phone=' + encodeURIComponent(phone), {
+        method: 'POST',
+        cache: 'no-store'
+      }).then(jsonOrThrow).then(function(d) {
+        r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error');
+        r.textContent = d.message || (d.success ? '已写入' : '写入失败');
+      }).catch(function(e) {
+        r.className = 'result-box result-error';
+        r.textContent = '请求失败: ' + e;
+      });
     }
 
     // ---- Flight Mode ----
@@ -994,7 +1018,7 @@
         if (!cd) return;
         if (!d.timeValid) cd.textContent = '时间未同步，倒计时暂不可用';
         else if (!d.lastTime) cd.textContent = '尚未建立基准日，启用后首次检查时建立';
-        else cd.textContent = '上次 ' + (d.lastTimeLocal || '--') + ' · 约 ' + d.daysLeft + ' 天后';
+        else cd.textContent = '上次 ' + (d.lastTimeLocal || '--').slice(0, 10) + ' · 约 ' + d.daysLeft + ' 天后';
       }).catch(function(){});
     }
     // 保号卡：启用态高亮 + kaForm 安全 arm（与自定义任务 st* 同一套保护）
@@ -1295,6 +1319,7 @@
       if (p === 'powering') return '模组上电中';
       if (p === 'at_ready') return 'AT已就绪';
       if (p === 'registering') return '网络注册中';
+      if (p === 'sim_locked') return 'SIM 已锁定';
       if (p === 'sampling') return '读取信息中';
       if (p === 'ready') return '已就绪';
       if (p === 'failed') return '注册超时';
@@ -1433,6 +1458,14 @@
         ovSet('tCellIp', d.dataEnabled ? (d.cellIp || '获取中') : '— (未启用)');
         ovSet('tPhone', d.phone || '--'); ovSet('tImei', pendingValue(d.imei, d.identityFresh, d)); ovSet('tIccid', pendingValue(d.iccid, d.identityFresh, d));
         ovSet('tImsi', pendingValue(d.imsi, d.identityFresh, d)); ovSet('tApn', apnText(d));
+        var simLock = document.getElementById('simLockStatus');
+        if (simLock) {
+          var lockNames = {ready:'SIM 已就绪', pin:'SIM 正在等待 PIN', puk:'SIM 正在等待 PUK', absent:'未检测到 SIM', other:'SIM 处于不支持的锁定状态', unknown:'SIM 状态未知'};
+          simLock.textContent = (lockNames[d.simState] || d.simState || 'SIM 状态未知') +
+            (d.simCredentialMatched ? '；已匹配 ICCID 凭据' : '') +
+            (d.simUnlockMessage ? '；' + d.simUnlockMessage : '');
+          simLock.className = 'result-box ' + (d.simState === 'ready' ? 'result-success' : (d.simState === 'pin' || d.simState === 'puk' ? 'result-error' : 'result-info'));
+        }
         // WiFi 详细信息卡片(独立卡，原"网络与SIM"里的 WiFi 行已移出)
         ovSet('wfSsid', d.ssid || '--');
         ovSet('wfIp', d.ip || '--'); ovSet('wfGw', d.gw || '--'); ovSet('wfMask', d.mask || '--');
@@ -1451,7 +1484,7 @@
         if (d.apMode) {
           var lv = document.getElementById('ovLive');
           if (lv) { lv.textContent = '● 配网模式（请到 WiFi 设置配置网络）'; lv.style.color = 'var(--error)'; }
-          if (!apHandled) { apHandled = true; switchPanel('sim'); }
+          if (!apHandled) { apHandled = true; switchPanel('sim'); }  // WiFi 配网表单在 SIM/网络页
         }
       }).catch(function() {
         if (seq !== statusSeq) return;
@@ -1622,6 +1655,13 @@
     }
 
     // ---- eSIM 本地管理 ----
+    function simPukUnlock() {
+      if (!confirm('PUK 输错可能永久锁死 SIM。确认使用当前 ICCID 已保存的 PUK，并把已保存 PIN 设置为新 PIN？')) return;
+      csrfFetch('/modem?action=sim-puk', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
+        showToast(d.message || 'PUK 解锁请求已提交', d.success ? 'ok' : 'err');
+        loadStatus();
+      }).catch(function(e){ showToast('PUK 解锁请求失败: ' + e, 'err'); });
+    }
     var esimTimer = null;
     function esimStateText(s) {
       if (s === 'enabled') return '启用';
@@ -1640,7 +1680,46 @@
       btn.onclick = function(){ esimRun(action, id, nick); };
       return btn;
     }
+    function esimRenderInstall(d) {
+      var host = document.getElementById('esimInstallHost');
+      var matching = document.getElementById('esimInstallMatchingId');
+      var status = document.getElementById('esimInstallStatus');
+      var start = document.getElementById('esimInstallStartBtn');
+      var confirmationBox = document.getElementById('esimConfirmationBox');
+      var confirmationInput = document.getElementById('esimConfirmationCode');
+      var confirmationSubmit = document.getElementById('esimConfirmationSubmitBtn');
+      if (!host || !matching || !status || !start) return;
+      host.textContent = d.installHost || '--';
+      matching.textContent = d.installMatchingIdMasked || '--';
+      var busy = !!(d.jobQueued || d.jobRunning);
+      var active = busy && d.action === 'install-start';
+      var waitingConfirmation = active && d.installPhase === 'waiting_confirmation';
+      start.disabled = busy;
+      if (confirmationBox && confirmationInput && confirmationSubmit) {
+        confirmationBox.style.display = waitingConfirmation ? '' : 'none';
+        if (!waitingConfirmation) confirmationInput.value = '';
+        confirmationSubmit.disabled = !waitingConfirmation || !confirmationInput.value.trim();
+        confirmationInput.oninput = function() {
+          confirmationSubmit.disabled = !this.value.trim();
+        };
+      }
+      if (d.action === 'install-start' && d.jobMessage) {
+        status.className = 'result-box ' + (active ? 'result-loading' : (d.jobSuccess ? 'result-success' : 'result-error'));
+        status.textContent = d.jobMessage;
+      } else if (busy) {
+        status.className = 'result-box result-loading';
+        status.textContent = d.jobMessage || '其它 eSIM 任务执行中';
+      } else if (!busy && (!d.action || d.action !== 'install-start')) {
+        status.className = 'result-box result-info';
+        status.textContent = '尚未提交下载任务';
+      }
+      if (!busy && d.action !== 'install-start') {
+        host.textContent = '--';
+        matching.textContent = '--';
+      }
+    }
     function esimRender(d) {
+      esimRenderInstall(d);
       var el = document.getElementById('esimEid'); if (el) el.textContent = d.eid || '未读取';
       el = document.getElementById('esimCount'); if (el) el.textContent = '共 ' + String(d.profileCount == null ? 0 : d.profileCount) + ' 个';
       el = document.getElementById('esimUpdated'); if (el) el.textContent = d.updatedLocal || '--';
@@ -1711,17 +1790,61 @@
       });
     }
     function esimStart(action, body) {
-      var box = document.getElementById('esimResult');
-      if (box) { box.className = 'result-box result-loading'; box.textContent = '正在提交 eSIM 任务...'; }
+      showToast('正在提交 eSIM 任务…', 'loading');
       csrfFetch('/esim?action=' + encodeURIComponent(action), {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body || ''}).then(jsonOrThrow).then(function(d) {
+        if (d.success && d.queued) { showToast(d.message || 'eSIM 任务已排队', 'loading'); esimLoadStatus(true); }
+        else { showToast(d.message || 'eSIM 任务启动失败', 'err'); }
+      }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
+    }
+    function esimInstallStart() {
+      var input = document.getElementById('esimActivationCode');
+      var start = document.getElementById('esimInstallStartBtn');
+      var compat = document.getElementById('esimEs9CompatMode');
+      if (!input || !input.value.trim()) {
+        showToast('请输入 Activation Code', 'err');
+        return;
+      }
+      if (start) start.disabled = true;
+      showToast('正在提交 eSIM 下载任务…', 'loading');
+      csrfFetch('/esim?action=install-start', {
+        method: 'POST', cache: 'no-store',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'activationCode=' + encodeURIComponent(input.value.trim()) +
+          (compat && compat.checked ? '&es9CompatMode=1' : '')
+      }).then(jsonOrThrow).then(function(d) {
         if (d.success && d.queued) {
-          if (box) box.textContent = d.message || 'eSIM 任务已排队';
+          input.value = '';
+          showToast(d.message || '下载任务已排队', 'loading');
           esimLoadStatus(true);
-        } else if (box) {
-          box.className = 'result-box result-error';
-          box.textContent = d.message || 'eSIM 任务启动失败';
+        } else {
+          if (start) start.disabled = false;
+          showToast(d.message || '下载任务启动失败', 'err');
         }
-      }).catch(function(e){ if (box) { box.className = 'result-box result-error'; box.textContent = '请求失败: ' + e; } });
+      }).catch(function(e) {
+        if (start) start.disabled = false;
+        showToast('请求失败: ' + e, 'err');
+      });
+    }
+    function esimInstallSubmitConfirmation() {
+      var input = document.getElementById('esimConfirmationCode');
+      var submit = document.getElementById('esimConfirmationSubmitBtn');
+      if (!input || !input.value.trim()) {
+        showToast('请输入 Confirmation Code', 'err');
+        return;
+      }
+      if (submit) submit.disabled = true;
+      csrfFetch('/esim?action=install-confirmation-code', {
+        method: 'POST', cache: 'no-store',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'confirmationCode=' + encodeURIComponent(input.value)
+      }).then(jsonOrThrow).then(function(d) {
+        if (d.success) input.value = '';
+        showToast(d.message || 'Confirmation Code 提交失败', d.success ? 'loading' : 'err');
+        esimLoadStatus(true);
+      }).catch(function(e) {
+        if (submit) submit.disabled = false;
+        showToast('请求失败: ' + e, 'err');
+      });
     }
     function esimInfo() { esimStart('info'); }
     function esimRefresh() { esimStart('refresh'); }
@@ -1742,8 +1865,7 @@
     }
 
     // ---- WiFi settings ----
-    var wifiNetworks = [];
-    var WIFI_MAX_NETWORKS = 5;
+    var WIFI_MAX_NETWORKS = 5, wifiNetworks = [];
     function setWifiScanMessage(text) {
       var sel = document.getElementById('wifiScanSel');
       if (!sel) return;
@@ -1752,168 +1874,292 @@
       o.textContent = text;
       sel.replaceChildren(o);
     }
-    function wifiScan() {
+    // 扫描结果统一回填上方配网下拉：无论扫描由“扫描”按钮还是历史列表聚焦触发
+    function wifiScanFillSelect(arr) {
       var sel = document.getElementById('wifiScanSel');
+      if (!sel) return;
+      if (!arr.length) { setWifiScanMessage('未发现 WiFi'); return; }
+      var first = document.createElement('option');
+      first.value = '';
+      first.textContent = '选择网络（共 ' + arr.length + ' 个）';
+      sel.replaceChildren(first);
+      arr.forEach(function(w) {
+        var o = document.createElement('option');
+        o.value = w.ssid;
+        o.textContent = (w.ssid || '(隐藏网络)') + '  ·  ' + w.rssi + ' dBm  ·  ' + (w.enc ? '加密' : '开放');
+        sel.appendChild(o);
+      });
+    }
+    function wifiScan() {  // 两张卡的“扫描”按钮共用：强制重扫并同步刷新两处下拉
       setWifiScanMessage('扫描中（约 3 秒）...');
-      fetch('/wifiscan?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(arr) {
-        if (!Array.isArray(arr) || !arr.length) { setWifiScanMessage('未发现 WiFi'); return; }
-        arr.sort(function(a, b){ return b.rssi - a.rssi; });
-        var first = document.createElement('option');
-        first.value = '';
-        first.textContent = '选择网络（共 ' + arr.length + ' 个）';
-        sel.replaceChildren(first);
-        arr.forEach(function(w) {
-          var o = document.createElement('option');
-          o.value = w.ssid;
-          o.textContent = (w.ssid || '(隐藏网络)') + '  ·  ' + w.rssi + ' dBm  ·  ' + (w.enc ? '加密' : '开放');
-          sel.appendChild(o);
-        });
-      }).catch(function(){ setWifiScanMessage('扫描失败'); });
+      wifiScanCache = null;
+      wifiScanReq = null;
+      wifiSuggestFetch().catch(function() {
+        setWifiScanMessage('扫描失败');
+      });
     }
     function wifiPick() {
-      var v = document.getElementById('wifiScanSel').value;
+      var sel = document.getElementById('wifiScanSel');
+      var v = sel ? sel.value : '';
       if (!v) return;
-      var idx = wifiNetworks.findIndex(function(n){ return n.ssid === v; });
-      if (idx < 0) idx = wifiAdd({ssid:v, passSet:false});
-      var passIn = document.getElementById('wifiPass' + idx);
-      if (passIn) passIn.focus();
+      wifiSyncFromDom();
+      var target = -1;
+      for (var i = 0; i < wifiNetworks.length; i++) {
+        if (!wifiNetworks[i].ssid) { target = i; break; }
+        if (wifiNetworks[i].ssid === v) { target = i; break; }
+      }
+      if (target < 0 && wifiNetworks.length < WIFI_MAX_NETWORKS) {
+        wifiNetworks.push({ ssid: '', passSet: false, pass: '', clearPass: false });
+        target = wifiNetworks.length - 1;
+      }
+      if (target < 0) { alert('最多保存 ' + WIFI_MAX_NETWORKS + ' 个 WiFi'); return; }
+      wifiNetworks[target].ssid = v;
+      wifiNetworks[target].pass = '';
+      wifiNetworks[target].clearPass = false;
+      wifiRenderList();
+      var pass = document.getElementById('wifiNetPass' + target);
+      if (pass) pass.focus();
+    }
+    function wifiNormalizeList(items, keepBlank) {
+      var out = [], seen = {};
+      (items || []).forEach(function(n) {
+        n = n || {};
+        var ssid = String(n.ssid || '').trim();
+        var pass = n.pass == null ? '' : String(n.pass);
+        if (!ssid && !keepBlank) return;
+        if (ssid) {
+          if (seen[ssid]) return;
+          seen[ssid] = true;
+        }
+        out.push({ ssid: ssid, passSet: !!n.passSet, pass: pass, clearPass: !!n.clearPass });
+      });
+      return out.slice(0, WIFI_MAX_NETWORKS);
     }
     function wifiSyncFromDom() {
       var next = [];
-      for (var i = 0; i < wifiNetworks.length && i < WIFI_MAX_NETWORKS; i++) {
-        var ssid = document.getElementById('wifiSsid' + i);
-        var pass = document.getElementById('wifiPass' + i);
-        var clear = document.getElementById('wifiClearPass' + i);
+      for (var i = 0; i < WIFI_MAX_NETWORKS; i++) {
+        var ssid = document.getElementById('wifiNetSsid' + i);
+        var pass = document.getElementById('wifiNetPass' + i);
+        var clear = document.getElementById('wifiNetClearPass' + i);
+        if (!ssid && !pass && !clear) continue;
         next.push({
           ssid: ssid ? ssid.value.trim() : '',
           pass: pass ? pass.value : '',
-          passSet: !!(wifiNetworks[i] && wifiNetworks[i].passSet),
-          clearPass: !!(clear && clear.checked)
+          passSet: wifiNetworks[i] ? !!wifiNetworks[i].passSet : false,
+          clearPass: clear ? !!clear.checked : false
         });
       }
-      wifiNetworks = next.filter(function(n){ return !!n.ssid; });
+      wifiNetworks = wifiNormalizeList(next, true);
+    }
+    function wifiUpdateCountBadge() {
+      var badge = document.getElementById('wifiCountBadge');
+      if (!badge) return;
+      var count = wifiNetworks.filter(function(n) { return n && n.ssid; }).length;
+      badge.textContent = count + ' / ' + WIFI_MAX_NETWORKS;
     }
     function wifiRenderList() {
       var host = document.getElementById('wifiListHost');
       if (!host) return;
       host.replaceChildren();
       if (!wifiNetworks.length) {
-        var empty = document.createElement('p');
-        empty.className = 'form-hint';
-        empty.textContent = '尚未保存已知 WiFi，可扫描或手动添加。';
-        host.appendChild(empty);
+        wifiNetworks.push({ ssid: '', passSet: false, pass: '', clearPass: false });
       }
-      wifiNetworks.slice(0, WIFI_MAX_NETWORKS).forEach(function(net, idx) {
-        var box = document.createElement('div');
-        box.className = 'form-grid two';
-        box.style.marginBottom = '10px';
+      wifiNetworks = wifiNetworks.slice(0, WIFI_MAX_NETWORKS);
+      wifiNetworks.forEach(function(n, i) {
+        var group = document.createElement('div');
+        group.className = 'form-group';
 
-        var ssidGroup = document.createElement('div');
-        ssidGroup.className = 'form-group';
-        var ssidLabel = document.createElement('label');
-        ssidLabel.className = 'form-label';
-        ssidLabel.textContent = '网络 ' + (idx + 1) + ' 名称 (SSID)';
-        var ssidInput = document.createElement('input');
-        ssidInput.className = 'form-input';
-        ssidInput.type = 'text';
-        ssidInput.id = 'wifiSsid' + idx;
-        ssidInput.value = net.ssid || '';
-        ssidGroup.appendChild(ssidLabel);
-        ssidGroup.appendChild(ssidInput);
+        var label = document.createElement('label');
+        label.className = 'form-label';
+        label.textContent = '网络 ' + (i + 1) + (i === 0 ? '（优先）' : '');
+        group.appendChild(label);
 
-        var passGroup = document.createElement('div');
-        passGroup.className = 'form-group';
-        var passLabel = document.createElement('label');
-        passLabel.className = 'form-label';
-        passLabel.textContent = '网络 ' + (idx + 1) + ' 密码';
-        var passInput = document.createElement('input');
-        passInput.className = 'form-input';
-        passInput.type = 'password';
-        passInput.id = 'wifiPass' + idx;
-        passInput.placeholder = net.passSet ? '留空=保留旧密码' : '开放网络可留空';
-        var clearLabel = document.createElement('label');
-        clearLabel.className = 'form-label';
-        clearLabel.style.marginTop = '6px';
-        clearLabel.style.fontWeight = '500';
-        var clearInput = document.createElement('input');
-        clearInput.type = 'checkbox';
-        clearInput.id = 'wifiClearPass' + idx;
-        clearLabel.appendChild(clearInput);
-        clearLabel.appendChild(document.createTextNode(' 清空已保存密码（开放网络）'));
-        var remove = document.createElement('button');
-        remove.type = 'button';
-        remove.className = 'btn btn-secondary btn-sm';
-        remove.textContent = '删除';
-        remove.onclick = function(){ wifiRemove(idx); };
-        remove.style.marginTop = '8px';
-        passGroup.appendChild(passLabel);
-        passGroup.appendChild(passInput);
-        passGroup.appendChild(clearLabel);
-        passGroup.appendChild(remove);
+        var row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.gap = '6px';
+        row.style.alignItems = 'center';
 
-        box.appendChild(ssidGroup);
-        box.appendChild(passGroup);
-        host.appendChild(box);
+        var wrap = document.createElement('div');
+        wrap.className = 'wifi-suggest-wrap';
+        var ssid = document.createElement('input');
+        ssid.className = 'form-input';
+        ssid.type = 'text';
+        ssid.id = 'wifiNetSsid' + i;
+        ssid.maxLength = 31;
+        ssid.autocomplete = 'off';
+        ssid.placeholder = 'SSID（留空 = 未使用）';
+        ssid.value = n.ssid || '';
+        ssid.addEventListener('focus', function() { wifiSuggestOpen(i); });
+        ssid.addEventListener('input', function() { wifiSuggestOpen(i); });
+        ssid.addEventListener('blur', function() { wifiSuggestClose(i); });
+        wrap.appendChild(ssid);
+        var suggest = document.createElement('div');
+        suggest.className = 'wifi-suggest';
+        suggest.id = 'wifiSuggest' + i;
+        suggest.style.display = 'none';
+        wrap.appendChild(suggest);
+        row.appendChild(wrap);
+
+        var del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'btn btn-secondary btn-sm';
+        del.textContent = '删除';
+        del.addEventListener('click', function() { wifiRemove(i); });
+        row.appendChild(del);
+        group.appendChild(row);
+
+        var pass = document.createElement('input');
+        pass.className = 'form-input';
+        pass.type = 'password';
+        pass.id = 'wifiNetPass' + i;
+        pass.maxLength = 63;
+        pass.placeholder = n.passSet ? '留空保持原密码' : ((n.ssid || '') ? '开放网络（无密码）' : '密码');
+        pass.style.marginTop = '4px';
+        pass.value = n.pass || '';
+        group.appendChild(pass);
+
+        if (n.passSet) {
+          var clearLabel = document.createElement('label');
+          clearLabel.className = 'schedule-switch';
+          clearLabel.style.marginTop = '6px';
+          var clear = document.createElement('input');
+          clear.type = 'checkbox';
+          clear.id = 'wifiNetClearPass' + i;
+          clear.checked = !!n.clearPass;
+          clearLabel.appendChild(clear);
+          clearLabel.appendChild(document.createTextNode(' 清除已保存密码（改为开放网络）'));
+          group.appendChild(clearLabel);
+        }
+        host.appendChild(group);
       });
+      wifiUpdateCountBadge();
     }
-    function wifiAdd(net) {
+    function wifiAdd() {
       wifiSyncFromDom();
-      if (wifiNetworks.length >= WIFI_MAX_NETWORKS) {
-        alert('最多保存 ' + WIFI_MAX_NETWORKS + ' 个 WiFi 网络');
-        return WIFI_MAX_NETWORKS - 1;
-      }
-      wifiNetworks.push(net || {ssid:'', passSet:false});
+      if (wifiNetworks.length >= WIFI_MAX_NETWORKS) { alert('最多保存 ' + WIFI_MAX_NETWORKS + ' 个 WiFi'); return; }
+      wifiNetworks.push({ ssid: '', passSet: false, pass: '', clearPass: false });
       wifiRenderList();
-      return wifiNetworks.length - 1;
+      var input = document.getElementById('wifiNetSsid' + (wifiNetworks.length - 1));
+      if (input) input.focus();
     }
-    function wifiRemove(idx) {
+    function wifiRemove(i) {
       wifiSyncFromDom();
-      wifiNetworks.splice(idx, 1);
+      wifiNetworks.splice(i, 1);
       wifiRenderList();
     }
     function wifiSave() {
       wifiSyncFromDom();
-      if (!wifiNetworks.length) { alert('请至少输入一个 WiFi 名称'); return; }
-      var names = wifiNetworks.map(function(n){ return n.ssid; }).join(' / ');
-      if (!confirm('保存并重启接入 “' + names + '”？设备将重启约 15-20 秒。')) return;
+      var nets = wifiNormalizeList(wifiNetworks, false);
+      if (!nets.length) { alert('请至少填写 1 个 WiFi 名称'); return; }
+      if (!confirm('保存 ' + nets.length + ' 个 WiFi 并重启接入？设备将重启约 15-20 秒。')) return;
       var r = document.getElementById('wifiCfgResult');
       r.className = 'result-box result-loading'; r.textContent = '保存中，设备即将重启...';
-      var body = new URLSearchParams();
-      body.append('wifiCount', String(wifiNetworks.length));
-      wifiNetworks.forEach(function(n, i) {
-        body.append('wifi' + i + 'Ssid', n.ssid);
-        body.append('wifi' + i + 'Pass', n.pass || '');
-        if (n.clearPass) body.append('wifi' + i + 'ClearPass', '1');
+      var params = new URLSearchParams();
+      params.set('wifiCount', String(nets.length));
+      nets.forEach(function(n, i) {
+        params.set('wifi' + i + 'Ssid', n.ssid);
+        params.set('wifi' + i + 'Pass', n.pass || '');
+        if (n.clearPass) params.set('wifi' + i + 'ClearPass', '1');
       });
-      csrfFetch('/wificonfig', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body.toString()}).then(jsonOrThrow).then(function(d) {
+      var tx = document.getElementById('wifiTxPowerQuarterDbm');
+      if (tx) params.set('wifiTxPowerQuarterDbm', tx.value || '34');
+      csrfFetch('/wificonfig', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:params.toString()}).then(jsonOrThrow).then(function(d) {
         r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
       }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备正在重启，请连接目标 WiFi 后重新访问设备'; });
     }
     function wifiPrefill() {
-      var hasConfiguredWifi = false;
-      ensureConfig(false).then(function(cfg) {
-        wifiNetworks = Array.isArray(cfg.wifiNetworks) ? cfg.wifiNetworks.map(function(n){
-          return {ssid:n.ssid || '', passSet:!!n.passSet, fallback:!!n.fallback};
-        }).filter(function(n){ return !!n.ssid; }) : [];
-        if (!wifiNetworks.length) {
-          if (cfg.wifiSsid) wifiNetworks.push({ssid:cfg.wifiSsid, passSet:true});
-          if (cfg.wifiSsid2 && cfg.wifiSsid2 !== cfg.wifiSsid) wifiNetworks.push({ssid:cfg.wifiSsid2, passSet:true});
-        }
-        hasConfiguredWifi = !!wifiNetworks.length;
-        wifiRenderList();
-      }).catch(function(){});
+      var cfg = webConfig || {};
+      var source = Array.isArray(cfg.wifiNetworks) ? cfg.wifiNetworks : [];
+      wifiNetworks = wifiNormalizeList(source, false);
+      wifiRenderList();
       fetch('/status?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+        var hasConfiguredWifi = wifiNetworks.some(function(n) { return n && n.ssid; });
         if (d.ssid && !d.apMode && !hasConfiguredWifi) {
-          wifiNetworks = [{ssid:d.ssid, passSet:false}];
+          wifiNetworks = [{ ssid: d.ssid, passSet: false, pass: '', clearPass: false }];
           wifiRenderList();
         }
+        if (d.apMode && !hasConfiguredWifi) wifiRenderList();
       }).catch(function(){});
+    }
+    function buildWifiNetworks(nets) {
+      nets = nets || [];
+      var html = '';
+      for (var i = 0; i < 5; i++) {
+        var n = nets[i] || {};
+        var has = !!n.ssid;
+        html += '<div class="form-group"><label class="form-label">网络 ' + (i + 1) + (i === 0 ? '（最近配网）' : '') + '</label>';
+        html += '<div style="display:flex;gap:6px;align-items:center;">';
+        html += '<div class="wifi-suggest-wrap">';
+        html += '<input class="form-input" type="text" name="wifi' + i + 'Ssid" id="wifiNetSsid' + i + '" value="' + htmlEsc(n.ssid || '') + '" placeholder="SSID（留空 = 未使用）" maxlength="32" autocomplete="off" onfocus="wifiSuggestOpen(' + i + ')" oninput="wifiSuggestOpen(' + i + ')" onblur="wifiSuggestClose(' + i + ')">';
+        html += '<div class="wifi-suggest" id="wifiSuggest' + i + '" style="display:none;"></div></div>';
+        html += '<button type="button" class="btn btn-secondary btn-sm" onclick="wifiNetClear(' + i + ')">删除</button></div>';
+        html += '<input class="form-input" type="password" name="wifi' + i + 'Pass" id="wifiNetPass' + i + '" value="" placeholder="' + (n.passSet ? '留空保持原密码' : (has ? '开放网络（无密码）' : '密码')) + '" maxlength="64" style="margin-top:4px;">';
+        html += '</div>';
+      }
+      return html;
+    }
+    function wifiNetClear(i) {
+      var s = document.getElementById('wifiNetSsid' + i), p = document.getElementById('wifiNetPass' + i);
+      if (s) s.value = '';
+      if (p) { p.value = ''; p.placeholder = '密码'; }
+    }
+    // SSID 扫描候选：首次聚焦自动扫描一次并缓存，点“扫描”按钮会刷新缓存
+    var wifiScanCache = null, wifiScanReq = null;
+    function wifiSuggestFetch() {
+      if (wifiScanCache) return Promise.resolve(wifiScanCache);
+      if (!wifiScanReq) {
+        wifiScanReq = fetch('/wifiscan?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(arr) {
+          arr = Array.isArray(arr) ? arr : [];
+          arr.sort(function(a, b){ return b.rssi - a.rssi; });
+          wifiScanCache = arr;
+          wifiScanFillSelect(arr);  // 任何来源的扫描都同步回填上方配网下拉
+          return arr;
+        }).catch(function(e){ wifiScanReq = null; throw e; });
+      }
+      return wifiScanReq;
+    }
+    function wifiSuggestOpen(i) {
+      var box = document.getElementById('wifiSuggest' + i);
+      var inp = document.getElementById('wifiNetSsid' + i);
+      if (!box || !inp) return;
+      box.style.display = 'block';
+      if (!wifiScanCache) box.innerHTML = '<div class="wifi-suggest-empty">扫描中（约 3 秒）...</div>';
+      wifiSuggestFetch().then(function(arr) {
+        if (box.style.display === 'none') return;   // 等待期间已失焦
+        var q = (inp.value || '').toLowerCase();
+        var items = arr.filter(function(w){ return w.ssid && (!q || w.ssid.toLowerCase().indexOf(q) >= 0); });
+        box.innerHTML = '';
+        if (!items.length) {
+          box.innerHTML = '<div class="wifi-suggest-empty">' + (arr.length ? '无匹配网络' : '未发现 WiFi') + '</div>';
+          return;
+        }
+        items.forEach(function(w) {
+          var d = document.createElement('div');
+          d.className = 'wifi-suggest-item';
+          var name = document.createElement('span'); name.textContent = w.ssid;
+          var meta = document.createElement('span'); meta.className = 'ws-meta';
+          meta.textContent = w.rssi + ' dBm · ' + (w.enc ? '加密' : '开放');
+          d.appendChild(name); d.appendChild(meta);
+          d.addEventListener('mousedown', function(e) {  // mousedown 先于 blur，选中不会被关闭吞掉
+            e.preventDefault();
+            inp.value = w.ssid;
+            box.style.display = 'none';
+          });
+          box.appendChild(d);
+        });
+      }).catch(function() {
+        if (box.style.display !== 'none') box.innerHTML = '<div class="wifi-suggest-empty">扫描失败，请点“扫描”重试</div>';
+      });
+    }
+    function wifiSuggestClose(i) {
+      var box = document.getElementById('wifiSuggest' + i);
+      if (box) box.style.display = 'none';
     }
 
     // ---- Config backup / OTA ----
     function doExport() { location.href = '/export'; }
     function doExportFull() {
-      if (!confirm('完整导出会包含 WiFi、Web、SMTP 和推送密钥明文。确定继续？')) return;
+      if (!confirm('完整导出会包含 WiFi、Web、SMTP、推送密钥及 SIM PIN/PUK 明文。确定继续？')) return;
       location.href = '/export?full=1';
     }
     function doImport() {

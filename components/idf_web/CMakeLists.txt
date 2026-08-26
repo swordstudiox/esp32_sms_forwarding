@@ -12,6 +12,7 @@ idf_component_register(
     idf_config
     idf_esim
     idf_inbox
+    idf_lpa
     idf_logbuf
     idf_modem
     idf_push

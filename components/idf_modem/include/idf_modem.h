@@ -30,6 +30,9 @@ struct IdfModemStatus {
     std::string apnSim;
     std::string cellIp;
     std::string phone;
+    std::string simState = "unknown";
+    bool simCredentialMatched = false;
+    std::string simUnlockMessage;
 };
 
 struct IdfCellularHttpResult {
@@ -52,13 +55,21 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
+esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* method,
+                                           const char* content_type, const std::string& body,
+                                           const IdfCellularHttpConfig& config,
+                                           IdfCellularHttpResult& result);
 esp_err_t idf_modem_request_reset(bool hard_reset);
+// 请求模组任务重新检查 SIM 锁；allow_puk=true 仅用于网页二次确认后的单次 PUK 操作。
+esp_err_t idf_modem_request_sim_unlock(bool allow_puk);
 bool idf_modem_take_urc(std::string& out);
 // 等待模组事件(新 URC 入缓冲/外部唤醒)，超时返回 false；用于替代固定轮询延时
 bool idf_modem_wait_event(uint32_t timeout_ms);
 // 唤醒等待者(短信任务)：URC 入缓冲、网页短信入队等场景调用
 void idf_modem_signal_event(void);
 IdfModemStatus idf_modem_get_status(void);
+// 获取合法数字 IMEI；优先使用缓存，缓存缺失时通过模组标准 IMEI 命令补采。
+esp_err_t idf_modem_get_imei(std::string& imei);
 // AT 通道当前是否空闲（Web 路由用于"模组正忙"快速返回，避免长时间阻塞 httpd 任务）
 bool idf_modem_at_idle(void);
 // 用户显式请求刷新概览模组信息时，短时间打开展示型身份/信号采样窗口。

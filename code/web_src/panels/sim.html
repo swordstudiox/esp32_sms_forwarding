@@ -27,10 +27,18 @@
               <p class="form-hint">从列表选运营商或手动填 PLMN(MCC+MNC，国外同理)。仅能选 SIM 可接入的网络，锁定不可达会失网；不确定留空自动。</p></div>
             <div class="form-group"><label class="form-label">本机号码（手填）</label>
               <input class="form-input" type="text" name="phoneNumber" value="%PHONE_NUMBER%" placeholder="卡不上报号码时用于概览显示，可留空">
-              <p class="form-hint">多数 eSIM/数据卡不通过 CNUM 上报本机号码，模组读不到时概览会显示这里的手填值。换卡后请更新或清空，否则会一直显示旧号码。</p>
               <div class="btn-row"><button type="button" class="btn btn-secondary btn-sm" onclick="writeOwnNumber()">写入 SIM 本机号码</button></div>
-              <p class="form-hint">该动作会把上方号码持久写入 SIM Own Number 电话本；不会发短信，也不会启用蜂窝数据。</p>
+              <p class="form-hint">多数 eSIM/数据卡不通过 CNUM 上报本机号码，模组读不到时概览会显示这里的手填值。写入 SIM 不会发短信，也不会启用蜂窝数据。</p>
               <div class="result-box" id="writeOwnNumberResult"></div></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">SIM PIN / PUK</div>
+          <div class="card-body">
+            <div class="result-box" id="simLockStatus">正在读取 SIM 锁定状态…</div>
+            <p class="form-hint" style="color:var(--error);font-weight:600">凭据只会用于完全匹配的 ICCID。PIN 可自动尝试；PUK 输错可能永久锁卡，只能点击按钮手动执行。</p>
+            <div class="sim-credential-list">%SIM_CREDENTIALS%</div>
+            <button type="button" class="btn btn-danger btn-block" onclick="simPukUnlock()">手动使用 PUK 解锁当前 SIM</button>
           </div>
         </div>
         <button type="submit" class="btn btn-primary btn-block btn-save">保存蜂窝设置</button>
@@ -42,7 +50,29 @@
               <div><span class="dk">EID</span><div class="dv" id="esimEid">未读取</div></div>
               <div><span class="dk">最后刷新</span><div class="dv" id="esimUpdated">--</div></div>
             </div>
-            <div class="esim-actions"><button class="btn btn-primary" type="button" onclick="esimInfo()">查询 eSIM 信息</button><button class="btn btn-secondary" type="button" onclick="esimRefresh()">刷新配置列表</button></div>
+            <div class="esim-actions">
+              <button class="btn btn-primary" type="button" onclick="esimInfo()">查询 eSIM 信息</button>
+              <button class="btn btn-secondary" type="button" onclick="esimRefresh()">刷新配置列表</button></div>
+            <div class="esim-install-box">
+              <div class="form-group">
+                <label class="form-label" for="esimActivationCode">手工输入 Activation Code</label>
+                <input class="form-input" type="text" id="esimActivationCode" maxlength="516" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="LPA:1$SM-DP+ 地址$MatchingID">
+              </div>
+              <div class="esim-install-preview">
+                <div><span class="dk">SM-DP+ 主机</span><div class="dv" id="esimInstallHost">--</div></div>
+                <div><span class="dk">MatchingID（脱敏）</span><div class="dv" id="esimInstallMatchingId">--</div></div>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-primary" type="button" id="esimInstallStartBtn" onclick="esimInstallStart()">开始下载</button>
+                <label class="switch-row" style="margin-left:12px;"><span class="switch-text">兼容模式</span><input type="checkbox" class="switch-input" id="esimEs9CompatMode"><span class="switch-slider"></span></label>
+              </div>
+              <p class="form-hint">兼容模式允许服务端缺少 X-Admin-Protocol 响应头</p>
+              <div id="esimConfirmationBox" style="display:none">
+                <div class="form-group"><label class="form-label" for="esimConfirmationCode">Confirmation Code</label><input class="form-input" type="password" id="esimConfirmationCode" maxlength="64" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+                <button class="btn btn-secondary" type="button" id="esimConfirmationSubmitBtn" onclick="esimInstallSubmitConfirmation()" disabled>提交</button>
+              </div>
+              <div class="result-box result-info" id="esimInstallStatus">尚未提交下载任务</div>
+            </div>
             <div class="esim-table-wrap">
               <table class="esim-table">
                 <thead><tr><th>ICCID</th><th>昵称</th><th>状态</th><th>操作</th></tr></thead>
@@ -54,12 +84,13 @@
         </div>
         <div class="sim-stack">
         <div class="card">
-          <div class="card-header">已知 WiFi 网络<button class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="wifiScan()">扫描</button></div>
+          <div class="card-header">WiFi 网络<span class="schedule-tag" id="wifiCountBadge">--</span><button class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="wifiScan()">扫描</button></div>
           <div class="card-body">
-            <div class="form-group"><label class="form-label">扫描结果</label><select class="form-select" id="wifiScanSel" onchange="wifiPick()"><option value="">点“扫描”获取周边 WiFi</option></select></div>
+            <div class="form-group"><label class="form-label">选择网络</label><select class="form-select" id="wifiScanSel" onchange="wifiPick()"><option value="">点“扫描”获取周边 WiFi</option></select></div>
+            <div class="form-group"><label class="form-label">WiFi 发射功率</label><select class="form-select" id="wifiTxPowerQuarterDbm" name="wifiTxPowerQuarterDbm">%WIFI_TX_POWER_OPTIONS%</select><p class="form-hint">ESP32-C3 SuperMini 板载天线建议保持 8.5 dBm；更高功率只适合射频和天线质量可靠的硬件，20 dBm 可能导致认证不稳定。</p></div>
             <div id="wifiListHost"></div>
-            <div class="btn-row"><button class="btn btn-secondary" onclick="wifiAdd()">添加网络</button><button class="btn btn-primary" onclick="wifiSave()">保存并重启接入</button><button class="btn btn-secondary" onclick="wifiRestart()">扫描重连</button></div>
-            <p class="form-hint">设备启动和重连时会扫描当前环境，优先连接信号最好的已知网络；开机 60 秒仍连不上会开启 10 分钟临时配网热点，运行中掉线不会自动开放热点。</p>
+            <div class="btn-row"><button type="button" class="btn btn-secondary" onclick="wifiAdd()">添加网络</button><button type="button" class="btn btn-primary" onclick="wifiSave()">保存并重启接入</button><button type="button" class="btn btn-secondary" onclick="wifiRestart()">重连当前网络</button></div>
+            <p class="form-hint">最多保存 5 组；设备启动/重连时会扫描周边并连接列表中在场且信号最好的网络。已存网络密码留空表示保持原密码，勾选清除密码可改为开放网络。</p>
             <div class="result-box" id="wifiCfgResult"></div>
             <div class="result-box" id="wifiResult"></div>
           </div>

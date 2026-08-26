@@ -1,6 +1,7 @@
 #include "idf_config.h"
 
 #include <algorithm>
+#include <cstring>
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -32,6 +33,14 @@ static SemaphoreHandle_t s_persist_mutex = nullptr;
 
 static esp_err_t save_config_to_nvs(const IdfConfig& c);
 static esp_err_t commit_config_update_locked(IdfConfig& next, const IdfConfig& base);
+static esp_err_t save_wifi_networks_locked(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
+                                           int count,
+                                           const bool preserve_blank_passes[IDF_MAX_WIFI_NETWORKS],
+                                           const bool clear_passes[IDF_MAX_WIFI_NETWORKS],
+                                           const IdfWifiNetwork saved[IDF_MAX_WIFI_NETWORKS],
+                                           uint8_t saved_count,
+                                           IdfWifiNetwork out[IDF_MAX_WIFI_NETWORKS],
+                                           uint8_t& out_count);
 
 static esp_err_t ensure_config_mutex()
 {
@@ -178,75 +187,71 @@ static void limit_utf8_bytes(std::string& value, size_t max_len)
     value.resize(end);
 }
 
+static bool digits_only(const std::string& value, size_t min_len, size_t max_len)
+{
+    if (value.size() < min_len || value.size() > max_len) return false;
+    return std::all_of(value.begin(), value.end(), [](unsigned char ch) { return isdigit(ch); });
+}
+
+static constexpr bool wifi_tx_power_valid(uint8_t power)
+{
+    return power == 8 || power == 20 || power == 28 || power == 34 || power == 44 ||
+           power == 52 || power == 56 || power == 60 || power == 66 || power == 72 || power == 80;
+}
+static_assert(wifi_tx_power_valid(34) && wifi_tx_power_valid(80) && !wifi_tx_power_valid(40),
+              "WiFi 功率档位必须与 ESP-IDF 映射表一致");
+
+static std::string trim_copy(const std::string& value);
+
+// mDNS 主机名规范化：只保留 DNS 标签合法字符(小写字母/数字/连字符)，大写转小写；
+// 容忍用户误填 http:// 前缀或 .local 后缀，自动剥离；结果为空回退默认 "sms"
 static void sanitize_mdns_host(std::string& host)
 {
+    std::string src = trim_copy(host);
+    if (src.rfind("http://", 0) == 0) src = src.substr(7);
+    else if (src.rfind("https://", 0) == 0) src = src.substr(8);
+    size_t dot = src.find('.');
+    if (dot != std::string::npos) src = src.substr(0, dot);
     std::string out;
-    out.reserve(host.size());
-    for (char ch : host) {
-        unsigned char c = static_cast<unsigned char>(ch);
-        if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
-        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
-            out.push_back(static_cast<char>(c));
-        } else if (c == '.') {
-            break;  // 用户输入 sms.local 时只保留 sms
-        }
+    for (char ch : src) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-';
+        if (ok) out += ch;
+        if (out.size() >= 32) break;  // DNS 标签上限 63，收紧到 32 足够且省应答缓冲
     }
     while (!out.empty() && out.front() == '-') out.erase(out.begin());
     while (!out.empty() && out.back() == '-') out.pop_back();
-    if (out.empty()) out = "sms";
-    if (out.size() > 32) out.resize(32);
-    host = out;
-}
-
-static void sync_wifi_compat_from_list(IdfConfig& c)
-{
-    c.wifiSsid.clear();
-    c.wifiPass.clear();
-    c.wifiSsid2.clear();
-    c.wifiPass2.clear();
-    c.wifiFromFallback = false;
-    if (c.wifiNetworkCount > 0) {
-        c.wifiSsid = c.wifiNetworks[0].ssid;
-        c.wifiPass = c.wifiNetworks[0].pass;
-        c.wifiFromFallback = c.wifiNetworks[0].fallback;
-    }
-    if (c.wifiNetworkCount > 1) {
-        c.wifiSsid2 = c.wifiNetworks[1].ssid;
-        c.wifiPass2 = c.wifiNetworks[1].pass;
-    }
+    host = out.empty() ? "sms" : out;
 }
 
 static esp_err_t normalize_config(IdfConfig& c)
 {
+    // 历史 WiFi 列表：截断超长字段、去掉空槽/同名重复并前移，保持槽位连续。
+    // 使用堆数组，避免未来在小栈任务中误复用规范化逻辑时把多个 std::string 数组压上栈。
     std::unique_ptr<IdfWifiNetwork[]> normalized(
         new (std::nothrow) IdfWifiNetwork[IDF_MAX_WIFI_NETWORKS]);
     if (!normalized) return ESP_ERR_NO_MEM;
     uint8_t normalized_count = 0;
-    auto append_wifi = [&](IdfWifiNetwork next) {
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        IdfWifiNetwork next = c.wifiNetworks[i];
         limit_utf8_bytes(next.ssid, 31);
         limit_utf8_bytes(next.pass, 63);
-        if (next.ssid.empty()) return;
-        for (uint8_t i = 0; i < normalized_count; ++i) {
-            if (normalized[i].ssid != next.ssid) continue;
-            if (normalized[i].pass.empty() && !next.pass.empty()) normalized[i].pass = next.pass;
-            normalized[i].fallback = normalized[i].fallback || next.fallback;
-            return;
+        if (is_blank(next.ssid)) continue;
+        bool dup = false;
+        for (uint8_t j = 0; j < normalized_count; ++j) {
+            if (normalized[j].ssid == next.ssid) {
+                dup = true;
+                break;
+            }
         }
-        if (normalized_count < IDF_MAX_WIFI_NETWORKS) normalized[normalized_count++] = next;
-    };
-
-    uint8_t input_count = c.wifiNetworkCount;
-    if (input_count > IDF_MAX_WIFI_NETWORKS) input_count = IDF_MAX_WIFI_NETWORKS;
-    for (uint8_t i = 0; i < input_count; ++i) append_wifi(c.wifiNetworks[i]);
-    if (normalized_count == 0) {
-        append_wifi({c.wifiSsid, c.wifiPass, c.wifiFromFallback});
-        append_wifi({c.wifiSsid2, c.wifiPass2, false});
+        if (dup) continue;
+        normalized[normalized_count++] = next;
     }
-    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) c.wifiNetworks[i] = {};
-    for (uint8_t i = 0; i < normalized_count; ++i) c.wifiNetworks[i] = normalized[i];
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        c.wifiNetworks[i] = i < normalized_count ? normalized[i] : IdfWifiNetwork();
+    }
     c.wifiNetworkCount = normalized_count;
-    sync_wifi_compat_from_list(c);
-
+    if (!wifi_tx_power_valid(c.wifiTxPowerQuarterDbm)) c.wifiTxPowerQuarterDbm = 34;
     limit_utf8_bytes(c.smtpServer, 128);
     c.smtpPort = (c.smtpPort > 0 && c.smtpPort <= 65535) ? c.smtpPort : 465;
     limit_utf8_bytes(c.smtpUser, 128);
@@ -277,6 +282,24 @@ static esp_err_t normalize_config(IdfConfig& c)
     limit_utf8_bytes(c.apn, 96);
     limit_utf8_bytes(c.operatorPlmn, 16);
     limit_utf8_bytes(c.phoneNumber, 64);
+
+    {
+        int w = 0;
+        for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+            IdfSimCredential item = c.simCredentials[i];
+            if (!digits_only(item.iccid, 15, 22)) continue;
+            if (!item.pin.empty() && !digits_only(item.pin, 4, 8)) item.pin.clear();
+            if (!item.puk.empty() && !digits_only(item.puk, 8, 8)) item.puk.clear();
+            item.pinMaxAttempts = static_cast<uint8_t>(clamp_int(item.pinMaxAttempts, 1, 2));
+            item.pukMaxAttempts = static_cast<uint8_t>(clamp_int(item.pukMaxAttempts, 1, 5));
+            item.pinFailedAttempts = std::min(item.pinFailedAttempts, item.pinMaxAttempts);
+            item.pukFailedAttempts = std::min(item.pukFailedAttempts, item.pukMaxAttempts);
+            bool duplicate = false;
+            for (int j = 0; j < w; ++j) duplicate = duplicate || c.simCredentials[j].iccid == item.iccid;
+            if (!duplicate) c.simCredentials[w++] = std::move(item);
+        }
+        for (; w < IDF_MAX_SIM_CREDENTIALS; ++w) c.simCredentials[w] = IdfSimCredential();
+    }
 
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         IdfPushChannel& ch = c.pushChannels[i];
@@ -469,6 +492,9 @@ static bool is_redacted_secret(const std::string& value)
     return value == "__REDACTED__";
 }
 
+// POSIX ERE 不认识 Perl 风格 \d \w \s；Arduino 版自研引擎支持这些转义，迁移前
+// 用户已存的转发规则依赖它们，先翻译成 POSIX 字符类再编译。
+// 保存时校验(本文件)与运行时匹配(idf_push)共用，保证两边语义一致。
 std::string idf_config_translate_perl_classes(const std::string& pattern)
 {
     std::string out;
@@ -565,21 +591,29 @@ esp_err_t idf_config_load(void)
     if (err == ESP_OK) {
         uint8_t wifi_count = read_u8(nvs, "wifiCount", 0);
         if (wifi_count > IDF_MAX_WIFI_NETWORKS) wifi_count = IDF_MAX_WIFI_NETWORKS;
-        for (uint8_t i = 0; i < wifi_count; ++i) {
-            char ssid_key[20];
-            char pass_key[20];
-            snprintf(ssid_key, sizeof(ssid_key), "wifi%dSsid", static_cast<int>(i));
-            snprintf(pass_key, sizeof(pass_key), "wifi%dPass", static_cast<int>(i));
-            next.wifiNetworks[i].ssid = read_str(nvs, ssid_key, "", 64);
-            next.wifiNetworks[i].pass = read_str(nvs, pass_key, "", 128);
-            next.wifiNetworks[i].fallback = false;
+        if (wifi_count > 0) {
+            for (uint8_t i = 0; i < wifi_count; ++i) {
+                char ssid_key[20];
+                char pass_key[20];
+                snprintf(ssid_key, sizeof(ssid_key), "wifi%dSsid", static_cast<int>(i));
+                snprintf(pass_key, sizeof(pass_key), "wifi%dPass", static_cast<int>(i));
+                next.wifiNetworks[i].ssid = read_str(nvs, ssid_key, "", 64);
+                next.wifiNetworks[i].pass = read_str(nvs, pass_key, "", 128);
+            }
+            next.wifiNetworkCount = wifi_count;
+        } else {
+            // 槽位 0 沿用旧键，其余槽位用 wifiNSsid/wifiNPass(N=1..4)，旧固件配置无缝升级
+            next.wifiNetworks[0].ssid = read_str(nvs, "wifiSsid", "", 64);
+            next.wifiNetworks[0].pass = read_str(nvs, "wifiPass", "", 128);
+            for (int i = 1; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+                char key[16];
+                snprintf(key, sizeof(key), "wifi%dSsid", i);
+                next.wifiNetworks[i].ssid = read_str(nvs, key, "", 64);
+                snprintf(key, sizeof(key), "wifi%dPass", i);
+                next.wifiNetworks[i].pass = read_str(nvs, key, "", 128);
+            }
         }
-        next.wifiNetworkCount = wifi_count;
-
-        next.wifiSsid = read_str(nvs, "wifiSsid", "", 64);
-        next.wifiPass = read_str(nvs, "wifiPass", "", 128);
-        next.wifiSsid2 = read_str(nvs, "wifiSsid2", "", 64);
-        next.wifiPass2 = read_str(nvs, "wifiPass2", "", 128);
+        next.wifiTxPowerQuarterDbm = read_u8(nvs, "wifiTxPwr", 34);
         next.smtpServer = read_str(nvs, "smtpServer", "", 128);
         next.smtpPort = read_i32(nvs, "smtpPort", 465);
         next.smtpUser = read_str(nvs, "smtpUser", "", 128);
@@ -619,6 +653,17 @@ esp_err_t idf_config_load(void)
         next.apn = read_str(nvs, "apn", "", 96);
         next.operatorPlmn = read_str(nvs, "opPlmn", "", 16);
         next.phoneNumber = read_str(nvs, "phoneNum", "", 64);
+        for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+            char key[20];
+            IdfSimCredential& item = next.simCredentials[i];
+            snprintf(key, sizeof(key), "sim%dIccid", i); item.iccid = read_str(nvs, key, "", 22);
+            snprintf(key, sizeof(key), "sim%dPin", i); item.pin = read_str(nvs, key, "", 8);
+            snprintf(key, sizeof(key), "sim%dPuk", i); item.puk = read_str(nvs, key, "", 8);
+            snprintf(key, sizeof(key), "sim%dPinMax", i); item.pinMaxAttempts = read_u8(nvs, key, 1);
+            snprintf(key, sizeof(key), "sim%dPukMax", i); item.pukMaxAttempts = read_u8(nvs, key, 1);
+            snprintf(key, sizeof(key), "sim%dPinFail", i); item.pinFailedAttempts = read_u8(nvs, key, 0);
+            snprintf(key, sizeof(key), "sim%dPukFail", i); item.pukFailedAttempts = read_u8(nvs, key, 0);
+        }
 
         for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
             char prefix[12];
@@ -669,16 +714,28 @@ esp_err_t idf_config_load(void)
         nvs_close(nvs);
     }
 
-    if (next.wifiNetworkCount == 0 && next.wifiSsid.empty() && WIFI_SSID[0]) {
+    bool has_any_wifi = false;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!is_blank(next.wifiNetworks[i].ssid)) { has_any_wifi = true; break; }
+    }
+    if (!has_any_wifi && WIFI_SSID[0]) {
         next.wifiNetworks[0].ssid = WIFI_SSID;
         next.wifiNetworks[0].pass = WIFI_PASS;
-        next.wifiNetworks[0].fallback = true;
-        next.wifiNetworkCount = 1;
+        next.wifiFromFallback = true;
     }
     esp_err_t norm_err = normalize_config(next);
     if (norm_err != ESP_OK) return norm_err;
 
-    std::string log_wifi = next.wifiSsid;
+    std::string log_wifi = next.wifiNetworks[0].ssid;
+    int log_wifi_extra = 0;
+    for (int i = 1; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!next.wifiNetworks[i].ssid.empty()) ++log_wifi_extra;
+    }
+    if (log_wifi_extra > 0) {
+        char extra[24];
+        snprintf(extra, sizeof(extra), " (+%d组备用)", log_wifi_extra);
+        log_wifi += extra;
+    }
     bool log_fallback = next.wifiFromFallback;
     std::string log_web_user = next.webUser;
     esp_err_t set_err = replace_config(next);
@@ -711,6 +768,7 @@ std::string idf_config_export_text(bool full_export)
         snprintf(key, sizeof(key), "wifi%dPass", i);
         append_kv(out, key, full_export ? net.pass : redact_secret(net.pass));
     }
+    append_kv_i(out, "wifiTxPowerQuarterDbm", c.wifiTxPowerQuarterDbm);
     append_kv(out, "smtpServer", c.smtpServer);
     append_kv_i(out, "smtpPort", c.smtpPort);
     append_kv(out, "smtpUser", c.smtpUser);
@@ -750,6 +808,17 @@ std::string idf_config_export_text(bool full_export)
     append_kv(out, "apn", c.apn);
     append_kv(out, "operatorPlmn", c.operatorPlmn);
     append_kv(out, "phoneNumber", c.phoneNumber);
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        char key[20];
+        const IdfSimCredential& item = c.simCredentials[i];
+        snprintf(key, sizeof(key), "sim%dIccid", i); append_kv(out, key, item.iccid);
+        snprintf(key, sizeof(key), "sim%dPin", i); append_kv(out, key, full_export ? item.pin : redact_secret(item.pin));
+        snprintf(key, sizeof(key), "sim%dPuk", i); append_kv(out, key, full_export ? item.puk : redact_secret(item.puk));
+        snprintf(key, sizeof(key), "sim%dPinMax", i); append_kv_i(out, key, item.pinMaxAttempts);
+        snprintf(key, sizeof(key), "sim%dPukMax", i); append_kv_i(out, key, item.pukMaxAttempts);
+        snprintf(key, sizeof(key), "sim%dPinFail", i); append_kv_i(out, key, item.pinFailedAttempts);
+        snprintf(key, sizeof(key), "sim%dPukFail", i); append_kv_i(out, key, item.pukFailedAttempts);
+    }
 
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         char key[24];
@@ -830,55 +899,35 @@ static std::string preserved_wifi_pass_for_import(const IdfConfig& base, const I
 static void apply_import_key(IdfConfig& c, const IdfConfig& base,
                              const std::string& key, const std::string& value)
 {
-    if (key == "wifiSsid") {
-        c.wifiSsid = value;
-        c.wifiNetworks[0].ssid = value;
-        if (c.wifiNetworkCount < 1) c.wifiNetworkCount = 1;
-        return;
-    }
-    if (key == "wifiPass" && !is_redacted_secret(value)) {
-        c.wifiPass = value;
-        c.wifiNetworks[0].pass = value;
-        if (c.wifiNetworkCount < 1) c.wifiNetworkCount = 1;
-        return;
-    }
-    if (key == "wifiSsid2") {
-        c.wifiSsid2 = value;
-        c.wifiNetworks[1].ssid = value;
-        if (c.wifiNetworkCount < 2) c.wifiNetworkCount = 2;
-        return;
-    }
-    if (key == "wifiPass2" && !is_redacted_secret(value)) {
-        c.wifiPass2 = value;
-        c.wifiNetworks[1].pass = value;
-        if (c.wifiNetworkCount < 2) c.wifiNetworkCount = 2;
-        return;
-    }
-    if (key == "wifiCount") {
-        int count = 0;
-        import_int_field(count, value);
-        count = clamp_int(count, 0, IDF_MAX_WIFI_NETWORKS);
-        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) c.wifiNetworks[i] = {};
-        for (int i = 0; i < count && i < base.wifiNetworkCount; ++i) {
-            c.wifiNetworks[i].pass = base.wifiNetworks[i].pass;
+    if (key == "wifiSsid") c.wifiNetworks[0].ssid = value;
+    else if (key == "wifiPass" && !is_redacted_secret(value)) c.wifiNetworks[0].pass = value;
+    else if (key == "wifiCount") {
+        // 导入完成后 normalize_config 会按实际非空槽位重新压实；这里保留键用于兼容旧备份。
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            if (is_redacted_secret(c.wifiNetworks[i].pass)) {
+                c.wifiNetworks[i].pass = base.wifiNetworks[i].pass;
+            }
         }
-        c.wifiNetworkCount = static_cast<uint8_t>(count);
-        return;
     }
-    int idx = 0;
-    std::string suffix;
-    if (parse_wifi_network_key(key, idx, suffix)) {
-        IdfWifiNetwork& net = c.wifiNetworks[idx];
-        if (suffix == "Ssid") net.ssid = value;
-        else if (suffix == "Pass") {
-            net.pass = is_redacted_secret(value) ? preserved_wifi_pass_for_import(base, c, idx) : value;
-        } else {
+    else {
+        int idx = -1;
+        std::string suffix;
+        if (parse_wifi_network_key(key, idx, suffix)) {
+            if (suffix == "Ssid") c.wifiNetworks[idx].ssid = value;
+            else if (suffix == "Pass") {
+                if (is_redacted_secret(value)) {
+                    c.wifiNetworks[idx].pass = base.wifiNetworks[idx].pass;
+                    std::string preserved = preserved_wifi_pass_for_import(base, c, idx);
+                    if (!preserved.empty()) c.wifiNetworks[idx].pass = preserved;
+                } else {
+                    c.wifiNetworks[idx].pass = value;
+                }
+            }
             return;
         }
-        if (c.wifiNetworkCount <= idx) c.wifiNetworkCount = static_cast<uint8_t>(idx + 1);
-        return;
     }
-    if (key == "smtpServer") c.smtpServer = value;
+    if (key == "wifiTxPowerQuarterDbm") import_u8_field(c.wifiTxPowerQuarterDbm, value);
+    else if (key == "smtpServer") c.smtpServer = value;
     else if (key == "smtpPort") import_int_field(c.smtpPort, value);
     else if (key == "smtpUser") c.smtpUser = value;
     else if (key == "smtpPass" && !is_redacted_secret(value)) c.smtpPass = value;
@@ -914,6 +963,19 @@ static void apply_import_key(IdfConfig& c, const IdfConfig& base,
     else if (key == "apn") c.apn = value;
     else if (key == "operatorPlmn") c.operatorPlmn = value;
     else if (key == "phoneNumber") c.phoneNumber = value;
+    else if (key.rfind("sim", 0) == 0 && key.size() > 4 && isdigit(static_cast<unsigned char>(key[3]))) {
+        int idx = key[3] - '0';
+        if (idx < 0 || idx >= IDF_MAX_SIM_CREDENTIALS) return;
+        std::string suffix = key.substr(4);
+        IdfSimCredential& item = c.simCredentials[idx];
+        if (suffix == "Iccid") item.iccid = value;
+        else if (suffix == "Pin" && !is_redacted_secret(value)) item.pin = value;
+        else if (suffix == "Puk" && !is_redacted_secret(value)) item.puk = value;
+        else if (suffix == "PinMax") import_u8_field(item.pinMaxAttempts, value);
+        else if (suffix == "PukMax") import_u8_field(item.pukMaxAttempts, value);
+        else if (suffix == "PinFail") import_u8_field(item.pinFailedAttempts, value);
+        else if (suffix == "PukFail") import_u8_field(item.pukFailedAttempts, value);
+    }
     else if (key.rfind("st", 0) == 0 && key.size() > 3 && isdigit(static_cast<unsigned char>(key[2]))) {
         int idx = key[2] - '0';
         if (idx < 0 || idx >= IDF_MAX_SCHED_TASKS) return;
@@ -954,21 +1016,10 @@ static void apply_import_key(IdfConfig& c, const IdfConfig& base,
 esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
 {
     if (text.empty()) return ESP_ERR_INVALID_ARG;
-    esp_err_t mutex_err = ensure_config_mutex();
-    if (mutex_err != ESP_OK) return mutex_err;
-    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
-
     std::unique_ptr<IdfConfig> base;
     esp_err_t err = config_snapshot_heap(base);
-    if (err != ESP_OK) {
-        xSemaphoreGive(s_persist_mutex);
-        return err;
-    }
-    std::unique_ptr<IdfConfig> next = make_config_copy(*base);
-    if (!next) {
-        xSemaphoreGive(s_persist_mutex);
-        return ESP_ERR_NO_MEM;
-    }
+    if (err != ESP_OK) return err;
+    IdfConfig next = *base;
     int applied = 0;
     size_t pos = 0;
     while (pos <= text.size()) {
@@ -984,7 +1035,7 @@ esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
             size_t keep = key.find_last_not_of(" \t\r\n");
             if (keep != std::string::npos) key.erase(keep + 1);
             if (!key.empty()) {
-                apply_import_key(*next, *base, key, value);
+                apply_import_key(next, *base, key, value);
                 ++applied;
             }
         }
@@ -992,8 +1043,9 @@ esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
         pos = end + 1;
     }
 
-    next->wifiFromFallback = false;
-    err = commit_config_update_locked(*next, *base);
+    next.wifiFromFallback = false;
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    err = commit_config_update_locked(next, *base);
     xSemaphoreGive(s_persist_mutex);
     if (err == ESP_OK && applied_count) *applied_count = applied;
     return err;
@@ -1137,27 +1189,60 @@ esp_err_t idf_config_set_call_notify_enabled(bool enabled)
     return err;
 }
 
+// 历史 WiFi 全槽位落盘：槽位 0 写旧键(OTA 回滚兼容)，其余写 wifiNSsid/wifiNPass
+static esp_err_t write_wifi_networks(nvs_handle_t nvs, const IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS])
+{
+    uint8_t count = 0;
+    while (count < IDF_MAX_WIFI_NETWORKS && !nets[count].ssid.empty()) ++count;
+    esp_err_t err = nvs_set_u8(nvs, "wifiCount", count);
+    if (err == ESP_OK) err = write_str(nvs, "wifiSsid", count > 0 ? nets[0].ssid : std::string());
+    if (err == ESP_OK) err = write_str(nvs, "wifiPass", count > 0 ? nets[0].pass : std::string());
+    for (int i = 0; err == ESP_OK && i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        char key[20];
+        snprintf(key, sizeof(key), "wifi%dSsid", i);
+        err = write_str(nvs, key, i < count ? nets[i].ssid : std::string());
+        if (err != ESP_OK) break;
+        snprintf(key, sizeof(key), "wifi%dPass", i);
+        err = write_str(nvs, key, i < count ? nets[i].pass : std::string());
+    }
+    for (int i = 1; err == ESP_OK && i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "wifi%dSsid", i);
+        err = write_str(nvs, key, i < count ? nets[i].ssid : std::string());
+        if (err != ESP_OK) break;
+        snprintf(key, sizeof(key), "wifi%dPass", i);
+        err = write_str(nvs, key, i < count ? nets[i].pass : std::string());
+    }
+    return err;
+}
+
+static esp_err_t write_wifi_network_fields(nvs_handle_t nvs,
+                                           const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
+                                           uint8_t count)
+{
+    IdfWifiNetwork compact[IDF_MAX_WIFI_NETWORKS];
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) compact[i] = i < count ? networks[i] : IdfWifiNetwork();
+    return write_wifi_networks(nvs, compact);
+}
+
+static void update_wifi_config_locked(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
+                                      uint8_t count)
+{
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        s_config.wifiNetworks[i] = i < count ? networks[i] : IdfWifiNetwork();
+    }
+    s_config.wifiNetworkCount = count;
+    s_config.wifiFromFallback = false;
+}
+
 static esp_err_t save_config_to_nvs(const IdfConfig& c)
 {
     nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open("sms_config", NVS_READWRITE, &nvs);
     if (err != ESP_OK) return err;
 
-    err = ESP_OK;
-    if (err == ESP_OK) err = nvs_set_u8(nvs, "wifiCount", c.wifiNetworkCount);
-    for (int i = 0; err == ESP_OK && i < IDF_MAX_WIFI_NETWORKS; ++i) {
-        char ssid_key[20];
-        char pass_key[20];
-        snprintf(ssid_key, sizeof(ssid_key), "wifi%dSsid", i);
-        snprintf(pass_key, sizeof(pass_key), "wifi%dPass", i);
-        const bool active = i < c.wifiNetworkCount;
-        if (err == ESP_OK) err = write_str(nvs, ssid_key, active ? c.wifiNetworks[i].ssid : std::string());
-        if (err == ESP_OK) err = write_str(nvs, pass_key, active ? c.wifiNetworks[i].pass : std::string());
-    }
-    if (err == ESP_OK) err = write_str(nvs, "wifiSsid", c.wifiSsid);
-    if (err == ESP_OK) err = write_str(nvs, "wifiPass", c.wifiPass);
-    if (err == ESP_OK) err = write_str(nvs, "wifiSsid2", c.wifiSsid2);
-    if (err == ESP_OK) err = write_str(nvs, "wifiPass2", c.wifiPass2);
+    err = write_wifi_networks(nvs, c.wifiNetworks);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "wifiTxPwr", c.wifiTxPowerQuarterDbm);
     if (err == ESP_OK) err = write_str(nvs, "smtpServer", c.smtpServer);
     if (err == ESP_OK) err = nvs_set_i32(nvs, "smtpPort", c.smtpPort);
     if (err == ESP_OK) err = write_str(nvs, "smtpUser", c.smtpUser);
@@ -1197,6 +1282,17 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
     if (err == ESP_OK) err = write_str(nvs, "apn", c.apn);
     if (err == ESP_OK) err = write_str(nvs, "opPlmn", c.operatorPlmn);
     if (err == ESP_OK) err = write_str(nvs, "phoneNum", c.phoneNumber);
+    for (int i = 0; err == ESP_OK && i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        char key[20];
+        const IdfSimCredential& item = c.simCredentials[i];
+        snprintf(key, sizeof(key), "sim%dIccid", i); err = write_str(nvs, key, item.iccid);
+        snprintf(key, sizeof(key), "sim%dPin", i); if (err == ESP_OK) err = write_str(nvs, key, item.pin);
+        snprintf(key, sizeof(key), "sim%dPuk", i); if (err == ESP_OK) err = write_str(nvs, key, item.puk);
+        snprintf(key, sizeof(key), "sim%dPinMax", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pinMaxAttempts);
+        snprintf(key, sizeof(key), "sim%dPukMax", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pukMaxAttempts);
+        snprintf(key, sizeof(key), "sim%dPinFail", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pinFailedAttempts);
+        snprintf(key, sizeof(key), "sim%dPukFail", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pukFailedAttempts);
+    }
 
     for (int i = 0; err == ESP_OK && i < IDF_MAX_PUSH_CHANNELS; ++i) {
         char prefix[12];
@@ -1286,173 +1382,17 @@ static esp_err_t commit_field_save(nvs_handle_t nvs, esp_err_t err, const char* 
     return err;
 }
 
-static esp_err_t write_wifi_network_fields(nvs_handle_t nvs,
-                                           const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
-                                           uint8_t count)
-{
-    esp_err_t err = nvs_set_u8(nvs, "wifiCount", count);
-    for (int i = 0; err == ESP_OK && i < IDF_MAX_WIFI_NETWORKS; ++i) {
-        char ssid_key[20];
-        char pass_key[20];
-        snprintf(ssid_key, sizeof(ssid_key), "wifi%dSsid", i);
-        snprintf(pass_key, sizeof(pass_key), "wifi%dPass", i);
-        const bool active = i < count;
-        err = write_str(nvs, ssid_key, active ? networks[i].ssid : std::string());
-        if (err == ESP_OK) err = write_str(nvs, pass_key, active ? networks[i].pass : std::string());
-    }
-    if (err == ESP_OK) err = write_str(nvs, "wifiSsid", count > 0 ? networks[0].ssid : std::string());
-    if (err == ESP_OK) err = write_str(nvs, "wifiPass", count > 0 ? networks[0].pass : std::string());
-    if (err == ESP_OK) err = write_str(nvs, "wifiSsid2", count > 1 ? networks[1].ssid : std::string());
-    if (err == ESP_OK) err = write_str(nvs, "wifiPass2", count > 1 ? networks[1].pass : std::string());
-    return err;
-}
-
-static void update_wifi_config_locked(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
-                                      uint8_t count)
-{
-    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
-        s_config.wifiNetworks[i] = i < count ? networks[i] : IdfWifiNetwork{};
-    }
-    s_config.wifiNetworkCount = count;
-    sync_wifi_compat_from_list(s_config);
-}
-
 static esp_err_t commit_config_update_locked(IdfConfig& next, const IdfConfig& base)
 {
-    esp_err_t err = normalize_config(next);
+    esp_err_t err = ensure_config_mutex();
     if (err != ESP_OK) return err;
+    err = normalize_config(next);
+    if (err != ESP_OK) return err;
+
     merge_runtime_markers(next, base);
     err = save_config_to_nvs(next);
     if (err == ESP_OK) err = replace_config(next);
     return err;
-}
-
-esp_err_t idf_config_save(void)
-{
-    esp_err_t err = ensure_config_mutex();
-    if (err != ESP_OK) return err;
-    // 快照必须在 persist 锁内取：锁外快照到提交之间完成的单字段保存会被整体回写覆盖
-    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
-    std::unique_ptr<IdfConfig> next;
-    err = config_snapshot_heap(next);
-    if (err == ESP_OK) err = normalize_config(*next);
-    if (err == ESP_OK) err = save_config_to_nvs(*next);
-    if (err == ESP_OK) err = replace_config(*next);
-    xSemaphoreGive(s_persist_mutex);
-    return err;
-}
-
-static esp_err_t save_wifi_networks_locked(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
-                                           int count,
-                                           const bool preserve_blank_passes[IDF_MAX_WIFI_NETWORKS],
-                                           const bool clear_passes[IDF_MAX_WIFI_NETWORKS],
-                                           const IdfWifiNetwork saved[IDF_MAX_WIFI_NETWORKS],
-                                           uint8_t saved_count,
-                                           IdfWifiNetwork out[IDF_MAX_WIFI_NETWORKS],
-                                           uint8_t& out_count)
-{
-    if (!networks || count <= 0 || count > IDF_MAX_WIFI_NETWORKS) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) out[i] = {};
-    out_count = 0;
-
-    auto saved_pass_for = [&](const std::string& ssid, int index) -> std::string {
-        for (int i = 0; i < saved_count && i < IDF_MAX_WIFI_NETWORKS; ++i) {
-            if (saved[i].ssid == ssid) return saved[i].pass;
-        }
-        if (index >= 0 && index < saved_count && index < IDF_MAX_WIFI_NETWORKS) {
-            return saved[index].pass;
-        }
-        return {};
-    };
-
-    for (int i = 0; i < count; ++i) {
-        IdfWifiNetwork next = networks[i];
-        next.fallback = false;
-        if (next.ssid.empty()) continue;
-        if (next.ssid.size() >= 32 || next.pass.size() >= 64) return ESP_ERR_INVALID_ARG;
-        bool clear = clear_passes && clear_passes[i];
-        bool preserve = preserve_blank_passes && preserve_blank_passes[i];
-        if (clear) {
-            next.pass.clear();
-        } else if (preserve && is_blank(next.pass)) {
-            next.pass = saved_pass_for(next.ssid, i);
-        }
-        if (next.pass.size() >= 64) return ESP_ERR_INVALID_ARG;
-        bool dup = false;
-        for (int j = 0; j < out_count; ++j) {
-            if (out[j].ssid == next.ssid) {
-                dup = true;
-                break;
-            }
-        }
-        if (dup) continue;
-        if (out_count < IDF_MAX_WIFI_NETWORKS) {
-            out[out_count++] = next;
-        }
-    }
-    if (out_count == 0) return ESP_ERR_INVALID_ARG;
-    return ESP_OK;
-}
-
-esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
-                                        int count,
-                                        const bool preserve_blank_passes[IDF_MAX_WIFI_NETWORKS],
-                                        const bool clear_passes[IDF_MAX_WIFI_NETWORKS])
-{
-    esp_err_t mutex_err = ensure_config_mutex();
-    if (mutex_err != ESP_OK) return mutex_err;
-    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
-
-    IdfWifiNetwork saved[IDF_MAX_WIFI_NETWORKS];
-    uint8_t saved_count = 0;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    saved_count = s_config.wifiNetworkCount;
-    if (saved_count > IDF_MAX_WIFI_NETWORKS) saved_count = IDF_MAX_WIFI_NETWORKS;
-    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) saved[i] = s_config.wifiNetworks[i];
-    xSemaphoreGive(s_config_mutex);
-
-    IdfWifiNetwork next[IDF_MAX_WIFI_NETWORKS];
-    uint8_t next_count = 0;
-    esp_err_t err = save_wifi_networks_locked(networks, count, preserve_blank_passes, clear_passes,
-                                              saved, saved_count, next, next_count);
-    nvs_handle_t nvs = 0;
-    if (err == ESP_OK) err = nvs_open("sms_config", NVS_READWRITE, &nvs);
-    if (err == ESP_OK) {
-        err = write_wifi_network_fields(nvs, next, next_count);
-        err = commit_field_save(nvs, err, "WiFi 网络列表");
-        nvs = 0;
-    } else if (nvs != 0) {
-        nvs_close(nvs);
-    }
-    if (err == ESP_OK) {
-        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-        update_wifi_config_locked(next, next_count);
-        xSemaphoreGive(s_config_mutex);
-    }
-    xSemaphoreGive(s_persist_mutex);
-    return err;
-}
-
-esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
-                               const std::string& ssid2, const std::string& pass2,
-                               bool preserve_blank_pass, bool preserve_blank_pass2,
-                               bool clear_pass, bool clear_pass2)
-{
-    IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS];
-    bool preserve[IDF_MAX_WIFI_NETWORKS] = {};
-    bool clear[IDF_MAX_WIFI_NETWORKS] = {};
-    networks[0].ssid = ssid;
-    networks[0].pass = pass;
-    networks[1].ssid = ssid2;
-    networks[1].pass = pass2;
-    preserve[0] = preserve_blank_pass;
-    preserve[1] = preserve_blank_pass2;
-    clear[0] = clear_pass;
-    clear[1] = clear_pass2;
-    return idf_config_save_wifi_networks(networks, 2, preserve, clear);
 }
 
 esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::string& pass)
@@ -1497,7 +1437,7 @@ esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::str
             err = ESP_ERR_NO_MEM;
         } else {
             for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
-                next_cfg->wifiNetworks[i] = i < next_count ? next[i] : IdfWifiNetwork{};
+                next_cfg->wifiNetworks[i] = i < next_count ? next[i] : IdfWifiNetwork();
             }
             next_cfg->wifiNetworkCount = next_count;
             next_cfg->wifiFromFallback = false;
@@ -1505,6 +1445,164 @@ esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::str
         }
     }
     xSemaphoreGive(s_persist_mutex);
+    if (err == ESP_OK && (base->wifiNetworkCount == 0 || base->wifiNetworks[0].ssid != ssid)) {
+        idf_logf("已连接新网络，自动加入历史 WiFi: %s", ssid.c_str());
+    }
+    return err;
+}
+
+static esp_err_t save_wifi_networks_locked(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
+                                           int count,
+                                           const bool preserve_blank_passes[IDF_MAX_WIFI_NETWORKS],
+                                           const bool clear_passes[IDF_MAX_WIFI_NETWORKS],
+                                           const IdfWifiNetwork saved[IDF_MAX_WIFI_NETWORKS],
+                                           uint8_t saved_count,
+                                           IdfWifiNetwork out[IDF_MAX_WIFI_NETWORKS],
+                                           uint8_t& out_count)
+{
+    if (!networks || count < 0 || count > IDF_MAX_WIFI_NETWORKS) return ESP_ERR_INVALID_ARG;
+
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) out[i] = IdfWifiNetwork();
+    out_count = 0;
+
+    auto saved_pass_for = [&](const std::string& ssid, int index) -> std::string {
+        for (int i = 0; i < saved_count && i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            if (saved[i].ssid == ssid) return saved[i].pass;
+        }
+        if (index >= 0 && index < saved_count && index < IDF_MAX_WIFI_NETWORKS) {
+            return saved[index].pass;
+        }
+        return {};
+    };
+
+    for (int i = 0; i < count; ++i) {
+        IdfWifiNetwork next = networks[i];
+        if (is_blank(next.ssid)) continue;
+        if (next.ssid.size() >= 32 || next.pass.size() >= 64) return ESP_ERR_INVALID_ARG;
+        bool clear = clear_passes && clear_passes[i];
+        bool preserve = preserve_blank_passes && preserve_blank_passes[i];
+        if (clear) {
+            next.pass.clear();
+        } else if (preserve && is_blank(next.pass)) {
+            next.pass = saved_pass_for(next.ssid, i);
+        }
+        bool duplicate = false;
+        for (int j = 0; j < out_count; ++j) {
+            if (out[j].ssid == next.ssid) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        out[out_count++] = next;
+    }
+    return ESP_OK;
+}
+
+esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
+                                        int count,
+                                        const bool preserve_blank_passes[IDF_MAX_WIFI_NETWORKS],
+                                        const bool clear_passes[IDF_MAX_WIFI_NETWORKS],
+                                        uint8_t wifi_tx_power_quarter_dbm)
+{
+    if (!wifi_tx_power_valid(wifi_tx_power_quarter_dbm)) return ESP_ERR_INVALID_ARG;
+    esp_err_t mutex_err = ensure_config_mutex();
+    if (mutex_err != ESP_OK) return mutex_err;
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    IdfWifiNetwork saved[IDF_MAX_WIFI_NETWORKS];
+    uint8_t saved_count = 0;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    saved_count = s_config.wifiNetworkCount;
+    if (saved_count > IDF_MAX_WIFI_NETWORKS) saved_count = IDF_MAX_WIFI_NETWORKS;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) saved[i] = s_config.wifiNetworks[i];
+    xSemaphoreGive(s_config_mutex);
+
+    IdfWifiNetwork next[IDF_MAX_WIFI_NETWORKS];
+    uint8_t next_count = 0;
+    esp_err_t err = save_wifi_networks_locked(networks, count, preserve_blank_passes, clear_passes,
+                                              saved, saved_count, next, next_count);
+    nvs_handle_t nvs = 0;
+    if (err == ESP_OK) err = nvs_open("sms_config", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = write_wifi_network_fields(nvs, next, next_count);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, "wifiTxPwr", wifi_tx_power_quarter_dbm);
+        err = commit_field_save(nvs, err, "WiFi 网络列表");
+        nvs = 0;
+    } else if (nvs != 0) {
+        nvs_close(nvs);
+    }
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        update_wifi_config_locked(next, next_count);
+        s_config.wifiTxPowerQuarterDbm = wifi_tx_power_quarter_dbm;
+        xSemaphoreGive(s_config_mutex);
+        if (next_count == 0) idf_log_line("WiFi 列表已清空，重启后将进入配网热点");
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
+                                        int count,
+                                        const bool preserve_blank_passes[IDF_MAX_WIFI_NETWORKS],
+                                        const bool clear_passes[IDF_MAX_WIFI_NETWORKS])
+{
+    esp_err_t mutex_err = ensure_config_mutex();
+    if (mutex_err != ESP_OK) return mutex_err;
+    uint8_t wifi_tx_power = 34;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    wifi_tx_power = s_config.wifiTxPowerQuarterDbm;
+    xSemaphoreGive(s_config_mutex);
+    return idf_config_save_wifi_networks(networks, count, preserve_blank_passes,
+                                         clear_passes, wifi_tx_power);
+}
+
+esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS],
+                                        bool preserve_blank_pass, uint8_t wifi_tx_power_quarter_dbm)
+{
+    if (!wifi_tx_power_valid(wifi_tx_power_quarter_dbm)) return ESP_ERR_INVALID_ARG;
+    bool preserve[IDF_MAX_WIFI_NETWORKS] = {};
+    bool clear[IDF_MAX_WIFI_NETWORKS] = {};
+    int count = 0;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        preserve[i] = preserve_blank_pass;
+        if (!is_blank(nets[i].ssid)) count = i + 1;
+    }
+    return idf_config_save_wifi_networks(nets, count, preserve, clear,
+                                         wifi_tx_power_quarter_dbm);
+}
+
+esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
+{
+    if (ssid.empty() || ssid.size() >= 32 || pass.size() >= 64) return ESP_ERR_INVALID_ARG;
+
+    IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS];
+    bool preserve[IDF_MAX_WIFI_NETWORKS] = {};
+    bool clear[IDF_MAX_WIFI_NETWORKS] = {};
+    nets[0].ssid = ssid;
+    nets[0].pass = pass;
+
+    esp_err_t mutex_err = ensure_config_mutex();
+    if (mutex_err != ESP_OK) return mutex_err;
+    uint8_t wifi_tx_power = 34;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    wifi_tx_power = s_config.wifiTxPowerQuarterDbm;
+    int count = 1;
+    for (int i = 0; i < s_config.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS && count < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (s_config.wifiNetworks[i].ssid.empty() || s_config.wifiNetworks[i].ssid == ssid) continue;
+        nets[count] = s_config.wifiNetworks[i];
+        preserve[count] = true;
+        ++count;
+    }
+    xSemaphoreGive(s_config_mutex);
+
+    esp_err_t err = idf_config_save_wifi_networks(nets, count, preserve, clear, wifi_tx_power);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.wifiFromFallback = false;
+        xSemaphoreGive(s_config_mutex);
+    }
     return err;
 }
 
@@ -1579,6 +1677,7 @@ esp_err_t idf_config_save_mdns_host(const std::string& host)
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
         s_config.mdnsHost = next_host;
         xSemaphoreGive(s_config_mutex);
+        idf_logf("mDNS 主机名已保存: http://%s.local", next_host.c_str());
     }
     xSemaphoreGive(s_persist_mutex);
     return err;
@@ -1827,12 +1926,10 @@ esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TAS
 
     IdfSchedTask next[IDF_MAX_SCHED_TASKS];
     IdfSchedTask previous[IDF_MAX_SCHED_TASKS];
-    bool was_enabled[IDF_MAX_SCHED_TASKS] = {};
     uint32_t last_run[IDF_MAX_SCHED_TASKS] = {};
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
     for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
         previous[i] = s_config.schedTasks[i];
-        was_enabled[i] = s_config.schedTasks[i].enabled;
         last_run[i] = s_config.schedTasks[i].lastRun;
     }
     xSemaphoreGive(s_config_mutex);
@@ -1854,9 +1951,9 @@ esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TAS
             next[i].lastRun = (next[i].enabled && now >= 1700000000u) ? now : 0;
         } else {
             next[i].lastRun = last_run[i];
-        }
-        if (next[i].enabled && !was_enabled[i] && next[i].lastRun == 0 && now >= 1700000000u) {
-            next[i].lastRun = now;
+            if (next[i].enabled && next[i].lastRun == 0 && now >= 1700000000u) {
+                next[i].lastRun = now;
+            }
         }
     }
 
@@ -1891,7 +1988,8 @@ esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TAS
 }
 
 esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std::string& apn,
-                              const std::string& operator_plmn, const std::string& phone_number)
+                              const std::string& operator_plmn, const std::string& phone_number,
+                              const IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS])
 {
     std::string next_apn = apn;
     std::string next_operator = operator_plmn;
@@ -1899,15 +1997,67 @@ esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std
     limit_utf8_bytes(next_apn, 96);
     limit_utf8_bytes(next_operator, 16);
     limit_utf8_bytes(next_phone, 64);
+    IdfSimCredential next_credentials[IDF_MAX_SIM_CREDENTIALS];
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        next_credentials[i] = credentials[i];
+        if (next_credentials[i].iccid.empty()) {
+            next_credentials[i] = IdfSimCredential();
+            continue;
+        }
+        if (!digits_only(next_credentials[i].iccid, 15, 22) ||
+            (!next_credentials[i].pin.empty() && !digits_only(next_credentials[i].pin, 4, 8)) ||
+            (!next_credentials[i].puk.empty() && !digits_only(next_credentials[i].puk, 8, 8))) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        next_credentials[i].pinMaxAttempts = static_cast<uint8_t>(clamp_int(next_credentials[i].pinMaxAttempts, 1, 2));
+        next_credentials[i].pukMaxAttempts = static_cast<uint8_t>(clamp_int(next_credentials[i].pukMaxAttempts, 1, 5));
+        for (int j = 0; j < i; ++j) {
+            if (next_credentials[j].iccid == next_credentials[i].iccid) return ESP_ERR_INVALID_ARG;
+        }
+    }
 
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
     if (err != ESP_OK) return err;
+    IdfSimSettingsView current = idf_config_get_sim_settings_view();
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        if (next_credentials[i].iccid.empty()) continue;
+        bool reset_pin = next_credentials[i].pinFailedAttempts == UINT8_MAX;
+        bool reset_puk = next_credentials[i].pukFailedAttempts == UINT8_MAX;
+        next_credentials[i].pinFailedAttempts = 0;
+        next_credentials[i].pukFailedAttempts = 0;
+        for (const auto& old : current.credentials) {
+            if (old.iccid != next_credentials[i].iccid) continue;
+            if (next_credentials[i].pin.empty()) next_credentials[i].pin = old.pin;
+            else if (next_credentials[i].pin != old.pin) next_credentials[i].pinFailedAttempts = 0;
+            if (next_credentials[i].puk.empty()) next_credentials[i].puk = old.puk;
+            else if (next_credentials[i].puk != old.puk) next_credentials[i].pukFailedAttempts = 0;
+            if (!reset_pin && next_credentials[i].pin == old.pin) next_credentials[i].pinFailedAttempts = old.pinFailedAttempts;
+            if (!reset_puk && next_credentials[i].puk == old.puk) next_credentials[i].pukFailedAttempts = old.pukFailedAttempts;
+            break;
+        }
+        next_credentials[i].pinFailedAttempts = std::min(next_credentials[i].pinFailedAttempts,
+                                                          next_credentials[i].pinMaxAttempts);
+        next_credentials[i].pukFailedAttempts = std::min(next_credentials[i].pukFailedAttempts,
+                                                          next_credentials[i].pukMaxAttempts);
+    }
+
     if (err == ESP_OK) err = nvs_set_u8(nvs, "dataEn", data_enabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "roamEn", roaming_enabled ? 1 : 0);
     if (err == ESP_OK) err = write_str(nvs, "apn", next_apn);
     if (err == ESP_OK) err = write_str(nvs, "opPlmn", next_operator);
     if (err == ESP_OK) err = write_str(nvs, "phoneNum", next_phone);
+    for (int i = 0; err == ESP_OK && i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        char key[20];
+        const IdfSimCredential& item = next_credentials[i];
+        snprintf(key, sizeof(key), "sim%dIccid", i); err = write_str(nvs, key, item.iccid);
+        snprintf(key, sizeof(key), "sim%dPin", i); if (err == ESP_OK) err = write_str(nvs, key, item.pin);
+        snprintf(key, sizeof(key), "sim%dPuk", i); if (err == ESP_OK) err = write_str(nvs, key, item.puk);
+        snprintf(key, sizeof(key), "sim%dPinMax", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pinMaxAttempts);
+        snprintf(key, sizeof(key), "sim%dPukMax", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pukMaxAttempts);
+        snprintf(key, sizeof(key), "sim%dPinFail", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pinFailedAttempts);
+        snprintf(key, sizeof(key), "sim%dPukFail", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pukFailedAttempts);
+    }
     err = commit_field_save(nvs, err, "蜂窝设置");
     if (err == ESP_OK) {
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
@@ -1916,6 +2066,46 @@ esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std
         s_config.apn = next_apn;
         s_config.operatorPlmn = next_operator;
         s_config.phoneNumber = next_phone;
+        for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) s_config.simCredentials[i] = next_credentials[i];
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_record_sim_unlock_result(const std::string& iccid, bool puk, bool success)
+{
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    IdfConfig current = config_snapshot();
+    int index = -1;
+    uint8_t value = 0;
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        if (current.simCredentials[i].iccid != iccid) continue;
+        index = i;
+        uint8_t old = puk ? current.simCredentials[i].pukFailedAttempts
+                          : current.simCredentials[i].pinFailedAttempts;
+        uint8_t limit = puk ? current.simCredentials[i].pukMaxAttempts
+                            : current.simCredentials[i].pinMaxAttempts;
+        value = success ? 0 : std::min<uint8_t>(static_cast<uint8_t>(old + 1), limit);
+        break;
+    }
+    if (index < 0) {
+        nvs_close(nvs);
+        xSemaphoreGive(s_persist_mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+    char key[20];
+    snprintf(key, sizeof(key), "sim%d%sFail", index, puk ? "Puk" : "Pin");
+    err = nvs_set_u8(nvs, key, value);
+    err = commit_field_save(nvs, err, "SIM 解锁计数");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        if (s_config.simCredentials[index].iccid == iccid) {
+            if (puk) s_config.simCredentials[index].pukFailedAttempts = value;
+            else s_config.simCredentials[index].pinFailedAttempts = value;
+        }
         xSemaphoreGive(s_config_mutex);
     }
     xSemaphoreGive(s_persist_mutex);
@@ -1966,12 +2156,6 @@ IdfConfigWebView idf_config_get_web_view(void)
     IdfConfigWebView view;
     if (ensure_config_mutex() != ESP_OK) return view;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    view.wifiNetworkCount = s_config.wifiNetworkCount;
-    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
-        view.wifiNetworks[i] = s_config.wifiNetworks[i];
-    }
-    view.wifiSsid = s_config.wifiSsid;
-    view.wifiSsid2 = s_config.wifiSsid2;
     view.webUser = s_config.webUser;
     view.webPass = s_config.webPass;
     view.smtpServer = s_config.smtpServer;
@@ -2002,6 +2186,22 @@ IdfConfigWebView idf_config_get_web_view(void)
     view.kaProfile = s_config.kaProfile;
     view.netLedEnabled = s_config.netLedEnabled;
     view.callNotifyEnabled = s_config.callNotifyEnabled;
+    view.wifiTxPowerQuarterDbm = s_config.wifiTxPowerQuarterDbm;
+    view.wifiNetworkCount = s_config.wifiNetworkCount;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        view.wifiNetworks[i].ssid = s_config.wifiNetworks[i].ssid;
+        view.wifiNetworks[i].passSet = !s_config.wifiNetworks[i].pass.empty();
+    }
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        const IdfSimCredential& item = s_config.simCredentials[i];
+        view.simCredentials[i].iccid = item.iccid;
+        view.simCredentials[i].pinSet = !item.pin.empty();
+        view.simCredentials[i].pukSet = !item.puk.empty();
+        view.simCredentials[i].pinMaxAttempts = item.pinMaxAttempts;
+        view.simCredentials[i].pukMaxAttempts = item.pukMaxAttempts;
+        view.simCredentials[i].pinFailedAttempts = item.pinFailedAttempts;
+        view.simCredentials[i].pukFailedAttempts = item.pukFailedAttempts;
+    }
     view.emailConfigured = email_configured_locked();
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         view.pushChannels[i] = s_config.pushChannels[i];
@@ -2058,6 +2258,23 @@ IdfSimSettingsView idf_config_get_sim_settings_view(void)
     view.roamingEnabled = s_config.roamingEnabled;
     view.apn = s_config.apn;
     view.operatorPlmn = s_config.operatorPlmn;
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) view.credentials[i] = s_config.simCredentials[i];
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid)
+{
+    IdfSimUnlockView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    for (const auto& item : s_config.simCredentials) {
+        if (item.iccid == iccid) {
+            view.found = true;
+            view.credential = item;
+            break;
+        }
+    }
     xSemaphoreGive(s_config_mutex);
     return view;
 }
@@ -2150,13 +2367,29 @@ bool idf_config_get_push_channel(uint8_t channel, IdfPushChannel& out)
 
 // 以下布尔/小字段访问器都在锁内直接求值：全量快照要深拷贝 42 个 std::string，
 // 在每个 HTTP 请求上都做一次会造成持续的堆分配抖动与碎片化
-bool idf_config_has_sta_credentials(void)
+std::vector<IdfWifiNetwork> idf_config_get_wifi_networks(void)
 {
-    if (ensure_config_mutex() != ESP_OK) return false;
+    std::vector<IdfWifiNetwork> nets;
+    if (ensure_config_mutex() != ESP_OK) return nets;
+    nets.reserve(IDF_MAX_WIFI_NETWORKS);
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    bool ok = s_config.wifiNetworkCount > 0;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!s_config.wifiNetworks[i].ssid.empty()) nets.push_back(s_config.wifiNetworks[i]);
+    }
     xSemaphoreGive(s_config_mutex);
-    return ok;
+    return nets;
+}
+
+int idf_config_wifi_network_count(void)
+{
+    if (ensure_config_mutex() != ESP_OK) return 0;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    int count = 0;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!s_config.wifiNetworks[i].ssid.empty()) ++count;
+    }
+    xSemaphoreGive(s_config_mutex);
+    return count;
 }
 
 bool idf_config_net_led_enabled(void)
@@ -2209,28 +2442,7 @@ void idf_config_copy_mdns_host(char* out, size_t cap)
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
     snprintf(out, cap, "%s", s_config.mdnsHost.c_str());
     xSemaphoreGive(s_config_mutex);
-}
-
-std::vector<IdfWifiNetwork> idf_config_get_wifi_networks(void)
-{
-    std::vector<IdfWifiNetwork> nets;
-    if (ensure_config_mutex() != ESP_OK) return nets;
-    nets.reserve(IDF_MAX_WIFI_NETWORKS);
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    for (int i = 0; i < s_config.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS; ++i) {
-        if (!s_config.wifiNetworks[i].ssid.empty()) nets.push_back(s_config.wifiNetworks[i]);
-    }
-    xSemaphoreGive(s_config_mutex);
-    return nets;
-}
-
-int idf_config_wifi_network_count(void)
-{
-    if (ensure_config_mutex() != ESP_OK) return 0;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    int count = s_config.wifiNetworkCount;
-    xSemaphoreGive(s_config_mutex);
-    return count;
+    if (out[0] == '\0') snprintf(out, cap, "sms");
 }
 
 bool idf_config_email_configured(void)

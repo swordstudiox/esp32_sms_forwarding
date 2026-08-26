@@ -175,22 +175,82 @@ const WebAsset* findWebPanelAsset(const char* name);
     return header, cpp
 
 
+def canonicalize_generated_cpp(cpp: str) -> str:
+    """按解压内容规范化生成文件，兼容 zlib 与 zlib-ng 的等价输出。"""
+    gzip_arrays: dict[str, bytes] = {}
+
+    def replace_array(match: re.Match[str]) -> str:
+        name = match.group(1)
+        data = bytes(int(value, 16) for value in re.findall(r"0x([0-9a-f]{2})", match.group(2)))
+        plain = gzip.decompress(data)
+        gzip_arrays[name] = data
+        digest = hashlib.sha256(plain).hexdigest()
+        return f"static const uint8_t {name}_DATA[] = {{\n  /* plain-sha256:{digest} */\n}};"
+
+    canonical = re.sub(
+        r"static const uint8_t ([A-Z0-9_]+)_DATA\[\] = \{\n(.*?)\n\};",
+        replace_array,
+        cpp,
+        flags=re.DOTALL,
+    )
+
+    seen_assets: set[str] = set()
+
+    def replace_asset(match: re.Match[str]) -> str:
+        name, data_name, size_name, mime, etag = match.groups()
+        if name != data_name or name != size_name or name not in gzip_arrays:
+            raise ValueError(f"invalid generated asset declaration: {name}")
+        expected_etag = hashlib.sha256(gzip_arrays[name]).hexdigest()[:16]
+        if etag != expected_etag:
+            raise ValueError(f"invalid generated asset etag: {name}")
+        seen_assets.add(name)
+        return (
+            f'const WebAsset {name} = {{ {name}_DATA, sizeof({name}_DATA), '
+            f'"{mime}", "\\"<gzip-etag>\\"" }};'
+        )
+
+    canonical = re.sub(
+        r'const WebAsset ([A-Z0-9_]+) = \{ ([A-Z0-9_]+)_DATA, '
+        r'sizeof\(([A-Z0-9_]+)_DATA\), "([^"]+)", "\\"([0-9a-f]+)\\"" \};',
+        replace_asset,
+        canonical,
+    )
+    if seen_assets != gzip_arrays.keys():
+        raise ValueError("generated asset declarations are incomplete")
+    return canonical
+
+
+def generated_assets_match(old_h: str, old_cpp: str, header: str, cpp: str) -> bool:
+    if old_h != header:
+        return False
+    if old_cpp == cpp:
+        return True
+    try:
+        return canonicalize_generated_cpp(old_cpp) == canonicalize_generated_cpp(cpp)
+    except (OSError, ValueError):
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="只检查生成文件是否最新")
     args = parser.parse_args()
 
     header, cpp = build_assets()
+    old_h = OUT_H.read_text(encoding="utf-8") if OUT_H.exists() else ""
+    old_cpp = OUT_CPP.read_text(encoding="utf-8") if OUT_CPP.exists() else ""
+    assets_match = generated_assets_match(old_h, old_cpp, header, cpp)
     if args.check:
-        old_h = OUT_H.read_text(encoding="utf-8") if OUT_H.exists() else ""
-        old_cpp = OUT_CPP.read_text(encoding="utf-8") if OUT_CPP.exists() else ""
-        if old_h != header or old_cpp != cpp:
+        if not assets_match:
             print("web assets are out of date; run: python tools/build_web_assets.py", file=sys.stderr)
             return 1
         return 0
 
-    OUT_H.write_text(header, encoding="utf-8")
-    OUT_CPP.write_text(cpp, encoding="utf-8")
+    if assets_match:
+        print("web assets are already up to date")
+        return 0
+    OUT_H.write_bytes(header.encode("utf-8"))
+    OUT_CPP.write_bytes(cpp.encode("utf-8"))
     print(f"generated {OUT_H.relative_to(ROOT)} and {OUT_CPP.relative_to(ROOT)}")
     return 0
 

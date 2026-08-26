@@ -1,6 +1,6 @@
 # ESP32-C3 native ESP-IDF defaults for the SMS forwarder port.
 # Keep generated sdkconfig under build/ by invoking idf.py with:
-#   idf.py -B build/idf -D "SDKCONFIG=build/sdkconfig" set-target esp32c3 build
+#   idf.py -B build/idf6 -D "SDKCONFIG=build/sdkconfig.idf6" set-target esp32c3 build
 
 CONFIG_IDF_TARGET="esp32c3"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
@@ -18,8 +18,10 @@ CONFIG_BT_ENABLED=n
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # 断言保留但不打印文件名/行号字符串(省 rodata)
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
-# 证书包用完整 CA 集：flash 尚有 30%+ 余量，避免小众推送服务因 CA 缺失握手失败
+# 证书包用完整公共 CA 集，并追加官方 GSMA RSP TLS 根集合；CA bundle 随现有固件 OTA 更新
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE_PATH="components/idf_lpa/certs/gsma_rsp_tls_roots.pem"
 # 本固件只用 IPv4(推送/SMTP/NTP/captive DNS 均为 v4)，关 IPv6 省 flash+RAM
 CONFIG_LWIP_IPV6=n
 # 无终端应用，不需要 termios
@@ -31,9 +33,7 @@ CONFIG_ESP_WIFI_NVS_ENABLED=n
 # 短信转发对 WiFi 吞吐无要求，把 WiFi 收发路径移出 IRAM 释放 ~20KB 内存
 CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_RX_IRAM_OPT=n
-# FreeRTOS/环形缓冲函数放 flash，再省若干 KB IRAM
-CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
-CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
+# IDF 6 已移除 FreeRTOS/环形缓冲函数放置开关，沿用其默认 flash 放置行为
 # TLS 收发缓冲按需分配、会话结束即释放(空闲期节省 ~40KB 堆；本机同时只有一条 TLS)
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
@@ -44,7 +44,5 @@ CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
 CONFIG_LWIP_MAX_SOCKETS=20
 # NTP 主服务器 + 2 个兜底(idf_wifi 里注册)，单服务器不可达时时间同步不再瘫痪
 CONFIG_LWIP_SNTP_MAX_SERVERS=3
-# 分区表本来就保留了 64KB coredump 分区，启用崩溃转储，无人值守设备排障必备
+# 分区表本来就保留了 64KB coredump 分区；IDF 6 固定使用 ELF 格式和 SHA-256 校验
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
-CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
-CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y

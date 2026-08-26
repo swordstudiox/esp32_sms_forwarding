@@ -32,12 +32,16 @@
 #include "idf_modem.h"
 #include "idf_util.h"
 #include "idf_wifi.h"
+#include "esp_idf_version.h"
 #include "mbedtls/base64.h"
-#include "mbedtls/ctr_drbg.h"
 #include "mbedtls/error.h"
 #include "mbedtls/md.h"
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#endif
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 
@@ -715,17 +719,34 @@ static uint32_t backoff_seconds(uint8_t attempts, uint32_t seed)
     return step + (jitter ? (seed % (jitter + 1)) : 0);
 }
 
+static bool http_transport_available()
+{
+    if (idf_wifi_get_status().staConnected) return true;
+    const IdfSimSettingsView sim = idf_config_get_sim_settings_view();
+    return sim.dataEnabled && idf_modem_get_status().modemReady;
+}
+
 static esp_err_t http_request(const std::string& url, const char* method,
                               const char* content_type, const std::string& body,
                               int& status_code)
 {
+    if (!idf_wifi_get_status().staConnected) {
+        const IdfSimSettingsView sim = idf_config_get_sim_settings_view();
+        IdfCellularHttpConfig cfg;
+        cfg.dataEnabled = sim.dataEnabled;
+        cfg.apn = sim.apn;
+        IdfCellularHttpResult result;
+        esp_err_t err = idf_modem_cellular_http_request(url, method, content_type, body, cfg, result);
+        status_code = result.httpStatus;
+        return err;
+    }
+
     esp_http_client_config_t cfg = {};
     cfg.url = url.c_str();
     cfg.timeout_ms = HTTP_TIMEOUT_MS;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.keep_alive_enable = false;
-    // 默认 TX 缓冲 512B 放不下长短信的 GET 请求行(百分号编码后可达 1.4KB+)；
-    // 长合并短信(中文×百分号编码可膨胀 9 倍)按实际 URL 长度放宽，避免必败重试
+    // 默认 TX 缓冲 512B 放不下长短信的 GET 请求行(百分号编码后可达 1.4KB+)。
     size_t tx_need = url.size() + 512;
     cfg.buffer_size_tx = static_cast<int>(tx_need < 2048 ? 2048 : tx_need);
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -765,16 +786,21 @@ struct SmtpConn {
     mbedtls_net_context net;
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
+    // MbedTLS 3.x (IDF 5.x)：需要本地 entropy/ctr_drbg 作为 TLS 随机源
     mbedtls_ctr_drbg_context ctrDrbg;
     mbedtls_entropy_context entropy;
+#endif
 
     SmtpConn()
     {
         mbedtls_net_init(&net);
         mbedtls_ssl_init(&ssl);
         mbedtls_ssl_config_init(&conf);
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
         mbedtls_ctr_drbg_init(&ctrDrbg);
         mbedtls_entropy_init(&entropy);
+#endif
     }
 };
 
@@ -790,8 +816,10 @@ static void smtp_conn_close(SmtpConn& conn)
     }
     mbedtls_ssl_free(&conn.ssl);
     mbedtls_ssl_config_free(&conn.conf);
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     mbedtls_ctr_drbg_free(&conn.ctrDrbg);
     mbedtls_entropy_free(&conn.entropy);
+#endif
     if (conn.sock >= 0) {
         close(conn.sock);
         conn.sock = -1;
@@ -881,6 +909,8 @@ static bool smtp_tcp_connect(const std::string& host, int port, SmtpConn& conn)
 
 static bool smtp_starttls_upgrade(SmtpConn& conn, const std::string& host)
 {
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
+    // IDF 5.x / MbedTLS 3.x：显式初始化 CTR-DRBG，并通过 conf_rng 注入
     const char* pers = "sms-smtp-starttls";
     int ret = mbedtls_ctr_drbg_seed(&conn.ctrDrbg, mbedtls_entropy_func, &conn.entropy,
                                     reinterpret_cast<const unsigned char*>(pers), strlen(pers));
@@ -888,13 +918,19 @@ static bool smtp_starttls_upgrade(SmtpConn& conn, const std::string& host)
         idf_logf("STARTTLS随机源初始化失败: -0x%04x", -ret);
         return false;
     }
+#else
+    // IDF 6.x / MbedTLS 4.x：PSA Crypto RNG 全局生效，ctr_drbg/conf_rng 已移除
+    int ret = 0;
+#endif
     ret = mbedtls_ssl_config_defaults(&conn.conf, MBEDTLS_SSL_IS_CLIENT,
                                       MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
     if (ret != 0) {
         idf_logf("STARTTLS配置初始化失败: -0x%04x", -ret);
         return false;
     }
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     mbedtls_ssl_conf_rng(&conn.conf, mbedtls_ctr_drbg_random, &conn.ctrDrbg);
+#endif
     mbedtls_ssl_conf_authmode(&conn.conf, MBEDTLS_SSL_VERIFY_REQUIRED);
     if (esp_crt_bundle_attach(&conn.conf) != ESP_OK) {
         idf_log_line("STARTTLS证书包挂载失败");
@@ -1684,8 +1720,8 @@ static bool low_heap_defer()
 
 static bool process_push_one()
 {
-    if (!idf_wifi_get_status().staConnected) return false;
-    if (low_heap_defer()) return false;  // 任务留在队列里，等堆恢复再发
+    if (!http_transport_available()) return false;
+    if (idf_wifi_get_status().staConnected && low_heap_defer()) return false;
     int picked = -1;
     PushJob job;
     int64_t now = esp_timer_get_time();
@@ -1830,8 +1866,8 @@ static bool process_email_one()
 
 static bool process_test_one()
 {
-    if (!idf_wifi_get_status().staConnected) return false;
-    if (low_heap_defer()) return false;
+    if (!http_transport_available()) return false;
+    if (idf_wifi_get_status().staConnected && low_heap_defer()) return false;
     int picked = -1;
     IdfPushChannel channel;
     const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
@@ -2045,8 +2081,8 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         message = "通道序号无效";
         return false;
     }
-    if (!idf_wifi_get_status().staConnected) {
-        message = "WiFi 未连接，暂不能测试推送";
+    if (!http_transport_available()) {
+        message = "WiFi 未连接且蜂窝数据不可用，暂不能测试推送";
         return false;
     }
     if (!ensure_init()) {

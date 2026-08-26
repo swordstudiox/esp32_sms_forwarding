@@ -58,7 +58,7 @@
     .sidebar-section-label { font-size: 9.5px; color: var(--faint); padding: 12px 14px 6px; text-transform: uppercase; letter-spacing: 0.16em; font-family: var(--mono); }
 
     /* Main */
-    .main { margin-left: var(--sidebar-w); flex: 1; padding: 24px 26px; max-width: 1480px; width: 100%; }
+    .main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; padding: 24px 26px; max-width: 1480px; width: auto; }
     .panel form { max-width: 780px; }
     /* 流动(masonry)布局：两列各自独立排列，卡片间距统一 14px；左右不强制对齐高度起点，消除"为对齐右列而产生的硬间隔" */
     .card-grid { column-count: 2; column-gap: 14px; }
@@ -69,7 +69,6 @@
     /* Card -> 模块 */
     .card { background: var(--canvas); border: 1px solid var(--hairline); border-radius: var(--radius-md); box-shadow: none; margin-bottom: 14px; }
     .card-header { padding: 11px 16px; font-size: 10px; font-weight: 600; color: var(--mute); letter-spacing: 0.12em; text-transform: uppercase; font-family: var(--mono); border-bottom: 1px solid var(--hairline); display: flex; align-items: center; gap: 8px; }
-    .card-chip { margin-left: auto; padding: 3px 7px; border: 1px solid var(--hairline); border-radius: var(--radius-sm); color: var(--faint); font: 600 10px/1 var(--mono); letter-spacing: 0; text-transform: none; }
     .card-body { padding: 14px 16px; }
     .card-header + .card-body { padding-top: 14px; }
 
@@ -248,6 +247,12 @@
     .esim-status-line { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(120px, 0.8fr); gap: 12px; margin-bottom: 12px; }
     .esim-status-line > div { min-width: 0; padding: 9px 10px; border: 1px solid var(--hairline); background: var(--inset); border-radius: var(--radius-sm); }
     .esim-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+    .esim-install-box { margin: 12px 0; padding: 12px; border: 1px solid var(--hairline); border-radius: var(--radius-sm); background: var(--canvas-soft); }
+    .esim-install-preview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin-bottom: 10px; }
+    .esim-install-preview > div { min-width: 0; padding: 8px 9px; border: 1px solid var(--hairline); background: var(--inset); border-radius: var(--radius-sm); }
+    .esim-install-preview .dv { margin: 4px 0 0; }
+    .esim-install-box .btn-row { margin-bottom: 10px; }
+    .esim-install-box .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .esim-table-wrap { overflow-x: auto; border: 1px solid var(--hairline); border-radius: var(--radius-sm); background: var(--inset); }
     .esim-table { width: 100%; min-width: 560px; border-collapse: collapse; font-size: 12px; }
     .esim-table th, .esim-table td { padding: 9px 10px; border-bottom: 1px solid var(--hairline); text-align: left; vertical-align: middle; }
@@ -260,6 +265,8 @@
     .esim-table .ops { display: flex; gap: 6px; flex-wrap: wrap; }
     .esim-table .ops .btn { flex: 0 0 auto; min-width: 64px; padding: 5px 9px; }
     .esim-table .ops .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .sim-credential { padding: 10px; border: 1px solid var(--hairline); background: var(--inset); border-radius: var(--radius-sm); margin-bottom: 10px; }
+    .sim-credential-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
 
     /* 定时任务：统一任务卡片列表 */
     .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 22px; }
@@ -299,8 +306,6 @@
     .btn-row { display: flex; gap: 7px; flex-wrap: wrap; }
     .btn-row .btn { flex: 1; min-width: 90px; }
     .btn-row + .btn-row { margin-top: 7px; }
-    .smtp-test-row { align-items: center; margin-top: 12px; }
-    .smtp-test-row .btn { flex: 0 0 auto; }
     #atLog {
       background: var(--inset); color: #5CB585; font-family: var(--mono); border: 1px solid var(--hairline);
       min-height: 130px; max-height: 260px; overflow-y: auto; padding: 12px 14px;
@@ -369,7 +374,8 @@
       .msg-sender { word-break: break-all; }
       .msg-drawer { width: 100vw; max-width: 100vw; }
       .sim-grid { display: grid; grid-template-columns: 1fr; }
-      .esim-status-line, .esim-actions { grid-template-columns: 1fr; }
+      .esim-status-line, .esim-actions, .esim-install-preview { grid-template-columns: 1fr; }
+      .sim-credential-grid { grid-template-columns: 1fr; }
       /* 窄屏统一：所有并排字段(SMTP 服务器/端口、周期/动作、任务名/周期…)改为竖排，
          并给 flex 子项 min-width:0，避免两个输入框把整页撑出横向滚动 */
       .form-row { flex-direction: column; gap: 10px; }

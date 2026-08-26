@@ -156,7 +156,7 @@ static bool sta_can_connect()
 static std::vector<StaCredential> build_sta_candidates(const IdfConfig& config)
 {
     std::vector<StaCredential> candidates;
-    for (int i = 0; i < config.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS; ++i) {
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
         const IdfWifiNetwork& net = config.wifiNetworks[i];
         if (net.ssid.empty()) continue;
         bool duplicate = false;
@@ -167,7 +167,8 @@ static std::vector<StaCredential> build_sta_candidates(const IdfConfig& config)
             }
         }
         if (duplicate) continue;
-        candidates.push_back({net.ssid, net.pass, i + 1, net.fallback});
+        candidates.push_back({net.ssid, net.pass, i + 1,
+                              config.wifiFromFallback && candidates.empty()});
     }
     return candidates;
 }
@@ -1299,13 +1300,11 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         return err;
     }
     s_started.store(true, std::memory_order_relaxed);
-    // ESP32-C3 SuperMini 板载天线匹配差，满功率发射时信号失真，AP 收不到认证帧，
-    // 表现为 auth (0xb0) -> init (0x200) 认证超时循环。限制到 8.5dBm 后可稳定连接。
-    // 单位 0.25dBm：34 * 0.25 = 8.5dBm
-    err = esp_wifi_set_max_tx_power(34);
+    // SuperMini 板载天线默认 8.5dBm 最稳；射频条件更好的硬件可从网页选择更高档位。
+    err = idf_wifi_set_tx_power(config.wifiTxPowerQuarterDbm);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_set_max_tx_power failed: %s", esp_err_to_name(err));
-        idf_logf("限制 WiFi 发射功率失败: %s", esp_err_to_name(err));
+        idf_logf("设置 WiFi 发射功率失败: %s", esp_err_to_name(err));
     }
     start_mdns_task_once();
     // 3072：任务里 start_provisioning_ap 会用到 wifi_config_t(~132B) + 日志格式化缓冲
@@ -1377,6 +1376,13 @@ esp_err_t idf_wifi_reconnect(void)
                              static_cast<int64_t>(WIFI_FAILOVER_OFFLINE_MS) * 1000LL,
                              std::memory_order_relaxed);
     return schedule_sta_failover("manual") ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+esp_err_t idf_wifi_set_tx_power(uint8_t quarter_dbm)
+{
+    if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
+    if (quarter_dbm < 8 || quarter_dbm > 84) return ESP_ERR_INVALID_ARG;
+    return esp_wifi_set_max_tx_power(static_cast<int8_t>(quarter_dbm));
 }
 
 esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string& pass)

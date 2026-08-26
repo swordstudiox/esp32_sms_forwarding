@@ -11,7 +11,8 @@
             <button type="button" class="at-chip" onclick="atQuick('AT+COPS?')">运营商</button>
             <button type="button" class="at-chip" onclick="atQuick('AT+CGPADDR=1')">PDP IP</button>
             <button type="button" class="at-chip" onclick="atQuick('AT+CPMS?')">短信存储</button>
-            <button type="button" class="at-chip" onclick="atQuick('AT+CGSN')">IMEI</button>
+            <button type="button" class="at-chip" onclick="atQuick('AT+CGSN')">模组序列号</button>
+            <button type="button" class="at-chip" onclick="atQuick('AT+CGSN=1')">IMEI</button>
           </div>
           <div class="at-bar"><input class="form-input" type="text" id="atCmd" placeholder="AT+CSQ　（↑/↓ 翻阅历史命令）"><button class="btn btn-primary btn-sm" onclick="sendAT()" id="atBtn">发送</button></div>
           <div class="btn-row" style="margin-top:8px;"><button class="btn btn-secondary btn-sm" onclick="clearATLog()">清空日志</button></div>

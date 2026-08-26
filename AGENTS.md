@@ -18,9 +18,16 @@ powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 ```
 
-The helper loads ESP-IDF 5.5.4, uses Ninja parallelism, and writes generated build files under `build/`.
+The helper loads ESP-IDF 6.0.2, applies the repository-managed Mbed TLS compatibility patch at `patches/mbedtls/`, uses Ninja parallelism, and writes generated files to `build/idf6` with configuration at `build/sdkconfig.idf6`.
 
-Minimum ESP-IDF: **v5.3+** — `components/idf_web` registers multi-method routes with `HTTP_ANY` (added to `esp_http_server` in v5.3); older IDF versions will fail to compile. Local helper and CI (`espressif/idf:release-v5.5`) both satisfy this.
+Required ESP-IDF: **v6.0.2**. The firmware targets Mbed TLS 4 / PSA Crypto and does not maintain ESP-IDF 5.x compatibility. CI uses the fixed `espressif/idf:v6.0.2` image and applies the same patch after checking that its source context applies cleanly.
+
+For direct Linux `idf.py` use, load the fixed SDK and apply the repository patch first:
+
+```bash
+. /home/alex/code/sdk/esp-idf/6.0/export.sh
+python tools/apply_idf_patches.py --idf-path "$IDF_PATH"
+```
 
 Before committing Web UI changes, run:
 
