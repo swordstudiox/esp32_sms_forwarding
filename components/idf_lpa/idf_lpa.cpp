@@ -203,6 +203,11 @@ static constexpr uint32_t kMinimumValidEpoch = 1700000000U;
 static constexpr uint32_t kEs9IoTimeoutMs = 15000U;
 static constexpr uint32_t kEs9TransactionTimeoutMs = 60000U;
 static constexpr uint32_t kEs9BppTransactionTimeoutMs = 30U * 60U * 1000U;
+static constexpr size_t kEs9TlsMinLargestFreeBlock = 50000U;
+static constexpr uint32_t kEs9TlsHeapWaitMs = 10000U;
+static constexpr uint32_t kEs9TlsHeapPollMs = 250U;
+static constexpr unsigned kEs9HttpConnectMaxAttempts = 3U;
+static constexpr uint32_t kEs9HttpConnectRetryDelayMs = 1500U;
 
 static void clear_sensitive_bytes(std::vector<uint8_t>& value)
 {
@@ -471,6 +476,36 @@ static bool check_rsp_protocol(const std::string& protocol,
     return true;
 }
 
+static bool wait_es9_tls_heap(const char* operation, std::string& message)
+{
+    for (uint32_t waited_ms = 0;; waited_ms += kEs9TlsHeapPollMs) {
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        if (largest >= kEs9TlsMinLargestFreeBlock) return true;
+        if (waited_ms >= kEs9TlsHeapWaitMs) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "ES9+ HTTPS 可用堆不足(%s 最大块=%u<%u)",
+                     operation ? operation : "请求",
+                     static_cast<unsigned>(largest),
+                     static_cast<unsigned>(kEs9TlsMinLargestFreeBlock));
+            message = buf;
+            idf_log_line(message.c_str());
+            return false;
+        }
+        if (waited_ms == 0) {
+            idf_logf("ES9+ %s 等待 TLS 可用堆恢复: 最大块=%u<%u",
+                     operation ? operation : "请求",
+                     static_cast<unsigned>(largest),
+                     static_cast<unsigned>(kEs9TlsMinLargestFreeBlock));
+        }
+        vTaskDelay(pdMS_TO_TICKS(kEs9TlsHeapPollMs));
+    }
+}
+
+static bool es9_http_connect_retryable(esp_err_t err, int status_code)
+{
+    return err == ESP_ERR_HTTP_CONNECT && status_code == 0;
+}
+
 static esp_err_t es9_post_json(const std::string& host,
                                const char* operation,
                                bool allow_missing_protocol,
@@ -498,75 +533,92 @@ static esp_err_t es9_post_json(const std::string& host,
     url += host;
     url += path;
 
-    Es9HttpCapture capture;
-    esp_http_client_config_t config = {};
-    config.url = url.c_str();
-    config.timeout_ms = static_cast<int>(kEs9IoTimeoutMs);
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.skip_cert_common_name_check = false;
-    config.keep_alive_enable = false;
-    config.disable_auto_redirect = true;
-    config.is_async = true;
-    config.buffer_size = 2048;
-    size_t tx_size = request_body.size() + 512U;
-    config.buffer_size_tx = static_cast<int>(std::min<size_t>(32768U, std::max<size_t>(2048U, tx_size)));
-    config.event_handler = es9_http_event_handler;
-    config.user_data = &capture;
+    esp_err_t last_err = ESP_OK;
+    for (unsigned attempt = 1U; attempt <= kEs9HttpConnectMaxAttempts; ++attempt) {
+        if (!wait_es9_tls_heap(operation, message)) return ESP_ERR_NO_MEM;
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        message = "ES9+ HTTPS 客户端内存不足";
-        return ESP_ERR_NO_MEM;
-    }
+        Es9HttpCapture capture;
+        esp_http_client_config_t config = {};
+        config.url = url.c_str();
+        config.timeout_ms = static_cast<int>(kEs9IoTimeoutMs);
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+        config.skip_cert_common_name_check = false;
+        config.keep_alive_enable = false;
+        config.disable_auto_redirect = true;
+        config.is_async = false;
+        config.buffer_size = 2048;
+        size_t tx_size = request_body.size() + 512U;
+        config.buffer_size_tx = static_cast<int>(std::min<size_t>(
+            32768U, std::max<size_t>(2048U, tx_size)));
+        config.event_handler = es9_http_event_handler;
+        config.user_data = &capture;
 
-    esp_err_t err = esp_http_client_set_method(client, HTTP_METHOD_POST);
-    if (err == ESP_OK) err = esp_http_client_set_header(client, "Content-Type", "application/json");
-    if (err == ESP_OK) err = esp_http_client_set_header(client, "User-Agent", "gsma-rsp-lpad");
-    if (err == ESP_OK) {
-        err = esp_http_client_set_header(client, "X-Admin-Protocol", "gsma/rsp/v2.7.0");
-    }
-    Es9Deadline deadline(kEs9TransactionTimeoutMs);
-    if (err == ESP_OK) {
-        err = es9_http_stream_request(client, request_body, deadline, &capture.streamError);
-    }
-    int status_code = esp_http_client_get_status_code(client);
-    Es9HttpDiagnostics diagnostics;
-    if (err == ESP_OK) {
-        idf_logf("ES9+ %s: HTTP=%d bodyBytes=%u overflow=%d protocol=%s",
-                 operation ? operation : "请求", status_code,
-                 static_cast<unsigned>(capture.responseBytes), capture.bodyOverflow ? 1 : 0,
-                 rsp_protocol_state(capture.adminProtocol, capture.adminProtocolSeen));
-    } else {
-        diagnostics = collect_es9_http_diagnostics(client);
-    }
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) {
+            message = "ES9+ HTTPS 客户端内存不足";
+            return ESP_ERR_NO_MEM;
+        }
 
-    if (capture.bodyOverflow) {
-        message = "ES9+ 响应超过大小上限";
-        return ESP_ERR_INVALID_SIZE;
+        esp_err_t err = esp_http_client_set_method(client, HTTP_METHOD_POST);
+        if (err == ESP_OK) err = esp_http_client_set_header(client, "Content-Type", "application/json");
+        if (err == ESP_OK) err = esp_http_client_set_header(client, "User-Agent", "gsma-rsp-lpad");
+        if (err == ESP_OK) {
+            err = esp_http_client_set_header(client, "X-Admin-Protocol", "gsma/rsp/v2.7.0");
+        }
+        Es9Deadline deadline(kEs9TransactionTimeoutMs);
+        if (err == ESP_OK) {
+            err = es9_http_stream_request(client, request_body, deadline, &capture.streamError);
+        }
+        int status_code = esp_http_client_get_status_code(client);
+        Es9HttpDiagnostics diagnostics;
+        if (err == ESP_OK) {
+            idf_logf("ES9+ %s: HTTP=%d bodyBytes=%u overflow=%d protocol=%s",
+                     operation ? operation : "请求", status_code,
+                     static_cast<unsigned>(capture.responseBytes), capture.bodyOverflow ? 1 : 0,
+                     rsp_protocol_state(capture.adminProtocol, capture.adminProtocolSeen));
+        } else {
+            diagnostics = collect_es9_http_diagnostics(client);
+        }
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        if (capture.bodyOverflow) {
+            message = "ES9+ 响应超过大小上限";
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (err != ESP_OK) {
+            last_err = err;
+            set_es9_http_error(message, operation, err, status_code, diagnostics);
+            if (attempt < kEs9HttpConnectMaxAttempts &&
+                es9_http_connect_retryable(err, status_code)) {
+                idf_logf("ES9+ HTTPS 连接失败，准备重试: op=%s attempt=%u/%u",
+                         operation ? operation : "请求",
+                         static_cast<unsigned>(attempt),
+                         static_cast<unsigned>(kEs9HttpConnectMaxAttempts));
+                vTaskDelay(pdMS_TO_TICKS(kEs9HttpConnectRetryDelayMs * attempt));
+                continue;
+            }
+            return err;
+        }
+        if (status_code != 200 && !(allow_empty_response && status_code == 204)) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "ES9+ HTTP 状态异常（%d）", status_code);
+            message = buf;
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        if (!check_rsp_protocol(capture.adminProtocol, capture.adminProtocolSeen,
+                                 allow_missing_protocol, operation, message)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        if (capture.body.empty()) {
+            if (allow_empty_response) return ESP_OK;
+            message = "ES9+ 响应为空";
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        response_body = std::move(capture.body);
+        return ESP_OK;
     }
-    if (err != ESP_OK) {
-        set_es9_http_error(message, operation, err, status_code, diagnostics);
-        return err;
-    }
-    if (status_code != 200 && !(allow_empty_response && status_code == 204)) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "ES9+ HTTP 状态异常（%d）", status_code);
-        message = buf;
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (!check_rsp_protocol(capture.adminProtocol, capture.adminProtocolSeen,
-                             allow_missing_protocol, operation, message)) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (capture.body.empty()) {
-        if (allow_empty_response) return ESP_OK;
-        message = "ES9+ 响应为空";
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    response_body = std::move(capture.body);
-    return ESP_OK;
+    return last_err == ESP_OK ? ESP_FAIL : last_err;
 }
 
 static bool json_decode_string(const std::string& json,
@@ -1439,16 +1491,20 @@ static void sample_largest_free_block(LpaDownloadStats& stats)
     }
 }
 
+struct BppSegmentContext {
+    const char* name = "unknown";
+    size_t index = 0;
+};
+
 class BppSegmentWriter {
 public:
     ~BppSegmentWriter() { close(); }
 
-    esp_err_t begin(std::string& message)
+    esp_err_t begin(const BppSegmentContext& context, std::string& message)
     {
-        close();
-        pending_size_ = 0;
-        block_number_ = 0;
-        clear_sensitive_bytes(last_response_);
+        if (active_) close();
+        reset_segment_state();
+        context_ = context;
         active_ = true;
         esp_err_t err = session_.begin_segment(message);
         if (err != ESP_OK) active_ = false;
@@ -1499,23 +1555,28 @@ public:
         }
         esp_err_t err = flush(true, message);
         if (err == ESP_OK) response = std::move(last_response_);
-        close();
+        reset_segment_state();
         return err;
     }
 
     void close()
     {
         session_.close();
+        reset_segment_state();
+        clear_sensitive_bytes(last_response_);
+    }
+
+private:
+    void reset_segment_state()
+    {
         active_ = false;
         volatile uint8_t* pending_bytes = pending_.data();
         for (size_t i = 0; i < pending_.size(); ++i) pending_bytes[i] = 0;
         pending_size_ = 0;
         segment_bytes_ = 0;
         block_number_ = 0;
-        clear_sensitive_bytes(last_response_);
     }
 
-private:
     esp_err_t flush(bool last, std::string& message)
     {
         if (pending_size_ == 0 || block_number_ > 0xFFU) {
@@ -1526,7 +1587,22 @@ private:
         esp_err_t err = session_.write_block(pending_.data(), pending_size_, last,
                                              static_cast<uint8_t>(block_number_),
                                              response.value, message);
-        if (err != ESP_OK) return err;
+        if (err != ESP_OK) {
+            std::string reason = message.empty() ? esp_err_to_name(err) : message;
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "BPP 写卡失败: segment=%s index=%u block=%u last=%d len=%u err=%s reason=%s",
+                     context_.name ? context_.name : "unknown",
+                     static_cast<unsigned>(context_.index),
+                     static_cast<unsigned>(block_number_),
+                     last ? 1 : 0,
+                     static_cast<unsigned>(pending_size_),
+                     esp_err_to_name(err),
+                     reason.c_str());
+            message = buf;
+            idf_log_line(message.c_str());
+            return err;
+        }
         if (!last && !response.value.empty()) {
             message = "BPP 中间 block 返回了异常响应数据";
             return ESP_ERR_INVALID_RESPONSE;
@@ -1545,6 +1621,7 @@ private:
     size_t pending_size_ = 0;
     size_t segment_bytes_ = 0;
     uint16_t block_number_ = 0;
+    BppSegmentContext context_;
     bool active_ = false;
     std::vector<uint8_t> last_response_;
 };
@@ -1774,7 +1851,10 @@ esp_err_t BppStreamParser::emit(const uint8_t* data, size_t length, std::string&
         return fail("BPP DER 容器长度不匹配", message);
     }
     esp_err_t err = writer_.write(data, length, message);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        record_failure();
+        return err;
+    }
     outer_remaining_ -= length;
     if (sequence_active_) sequence_remaining_ -= length;
     if (decoded_bytes_ > kMaxBppDecodedBytes - length) {
@@ -1788,7 +1868,10 @@ esp_err_t BppStreamParser::finish_segment(std::string& message)
 {
     std::vector<uint8_t> response;
     esp_err_t err = writer_.finish(response, message);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        record_failure();
+        return err;
+    }
     if (!response.empty()) {
         if (!installation_result_.value.empty()) {
             return fail("BPP 返回了多个 ProfileInstallationResult", message);
@@ -1820,10 +1903,16 @@ esp_err_t BppStreamParser::handle_header(std::string& message)
                 return fail("BPP 外层 tag 无效", message);
             }
             outer_remaining_ = length;
-            esp_err_t err = writer_.begin(message);
-            if (err != ESP_OK) return err;
+            esp_err_t err = writer_.begin({"initialiseSecureChannel", segment_count_ + 1U}, message);
+            if (err != ESP_OK) {
+                record_failure();
+                return err;
+            }
             err = writer_.write(raw.data(), raw.size(), message);
-            if (err != ESP_OK) return err;
+            if (err != ESP_OK) {
+                record_failure();
+                return err;
+            }
             decoded_bytes_ += raw.size();
             state_ = State::outer_child;
             return ESP_OK;
@@ -1843,8 +1932,11 @@ esp_err_t BppStreamParser::handle_header(std::string& message)
             if (!expect_tag(false, 0xA0) || length == 0) {
                 return fail("BPP firstSequenceOf87 tag 无效", message);
             }
-            esp_err_t err = writer_.begin(message);
-            if (err != ESP_OK) return err;
+            esp_err_t err = writer_.begin({"firstSequenceOf87", segment_count_ + 1U}, message);
+            if (err != ESP_OK) {
+                record_failure();
+                return err;
+            }
             err = emit(raw.data(), raw.size(), message);
             if (err != ESP_OK) return err;
             sequence_remaining_ = length;
@@ -1868,8 +1960,11 @@ esp_err_t BppStreamParser::handle_header(std::string& message)
             if (!expect_tag(false, 0xA1) || length == 0) {
                 return fail("BPP sequenceOf88 tag 无效", message);
             }
-            esp_err_t err = writer_.begin(message);
-            if (err != ESP_OK) return err;
+            esp_err_t err = writer_.begin({"sequenceOf88Header", segment_count_ + 1U}, message);
+            if (err != ESP_OK) {
+                record_failure();
+                return err;
+            }
             err = emit(raw.data(), raw.size(), message);
             if (err != ESP_OK) return err;
             sequence_remaining_ = length;
@@ -1884,8 +1979,11 @@ esp_err_t BppStreamParser::handle_header(std::string& message)
             if (!expect_tag(false, 0x88) || length == 0) {
                 return fail("BPP 88 TLV 无效", message);
             }
-            esp_err_t err = writer_.begin(message);
-            if (err != ESP_OK) return err;
+            esp_err_t err = writer_.begin({"metadata", child_count_ + 1U}, message);
+            if (err != ESP_OK) {
+                record_failure();
+                return err;
+            }
             err = emit(raw.data(), raw.size(), message);
             if (err != ESP_OK) return err;
             value_remaining_ = length;
@@ -1896,8 +1994,11 @@ esp_err_t BppStreamParser::handle_header(std::string& message)
         case State::second_sequence_or_profile: {
             if (expect_tag(false, 0xA2)) {
                 if (length == 0) return fail("BPP secondSequenceOf87 为空", message);
-                esp_err_t err = writer_.begin(message);
-                if (err != ESP_OK) return err;
+                esp_err_t err = writer_.begin({"secondSequenceOf87", segment_count_ + 1U}, message);
+                if (err != ESP_OK) {
+                    record_failure();
+                    return err;
+                }
                 err = emit(raw.data(), raw.size(), message);
                 if (err != ESP_OK) return err;
                 sequence_remaining_ = length;
@@ -1909,8 +2010,11 @@ esp_err_t BppStreamParser::handle_header(std::string& message)
             if (!expect_tag(false, 0xA3) || length == 0) {
                 return fail("BPP sequenceOf86 tag 无效", message);
             }
-            esp_err_t err = writer_.begin(message);
-            if (err != ESP_OK) return err;
+            esp_err_t err = writer_.begin({"sequenceOf86Header", segment_count_ + 1U}, message);
+            if (err != ESP_OK) {
+                record_failure();
+                return err;
+            }
             err = emit(raw.data(), raw.size(), message);
             if (err != ESP_OK) return err;
             sequence_remaining_ = length;
@@ -1936,8 +2040,11 @@ esp_err_t BppStreamParser::handle_header(std::string& message)
             if (!expect_tag(false, 0xA3) || length == 0) {
                 return fail("BPP sequenceOf86 tag 无效", message);
             }
-            esp_err_t err = writer_.begin(message);
-            if (err != ESP_OK) return err;
+            esp_err_t err = writer_.begin({"sequenceOf86Header", segment_count_ + 1U}, message);
+            if (err != ESP_OK) {
+                record_failure();
+                return err;
+            }
             err = emit(raw.data(), raw.size(), message);
             if (err != ESP_OK) return err;
             sequence_remaining_ = length;
@@ -1952,8 +2059,11 @@ esp_err_t BppStreamParser::handle_header(std::string& message)
             if (!expect_tag(false, 0x86) || length == 0) {
                 return fail("BPP 86 TLV 无效", message);
             }
-            esp_err_t err = writer_.begin(message);
-            if (err != ESP_OK) return err;
+            esp_err_t err = writer_.begin({"profileElement", child_count_ + 1U}, message);
+            if (err != ESP_OK) {
+                record_failure();
+                return err;
+            }
             err = emit(raw.data(), raw.size(), message);
             if (err != ESP_OK) return err;
             value_remaining_ = length;
@@ -2482,6 +2592,7 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
     }
 
     std::string url = "https://" + host + "/gsma/rsp2/es9plus/getBoundProfilePackage";
+    if (!wait_es9_tls_heap("GetBPP", message)) return ESP_ERR_NO_MEM;
     Es9BppCapture capture;
     capture.scanner = &scanner;
     capture.scannerMessage = &message;
@@ -2495,7 +2606,7 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
     config.skip_cert_common_name_check = false;
     config.keep_alive_enable = false;
     config.disable_auto_redirect = true;
-    config.is_async = true;
+    config.is_async = false;
     config.buffer_size = 2048;
     config.buffer_size_tx = static_cast<int>(std::min<size_t>(32768U,
         std::max<size_t>(2048U, request_body.size() + 512U)));

@@ -25,9 +25,11 @@ namespace {
 static constexpr const char* ISDR_AID_HEX = "A0000005591010FFFFFFFF8900000100";
 // lpac 默认单块 120 字节：240 个 HEX 字符加框架不会超过常见模组的 AT 行长限制。
 static constexpr size_t STORE_DATA_MSS = 120;
-// ES10c 列表只取 UI 所需字段；给畸形 61xx 响应链留上限，避免后台任务无限占用蜂窝通道。
-static constexpr size_t APDU_RESPONSE_DATA_MAX = 16 * 1024;
-static constexpr size_t GET_RESPONSE_CHAIN_MAX = 64;
+// 兼容会返回大量短 61xx 分段的 eUICC；同时保留总字节和无进展保护，避免异常卡片
+// 让后台任务无限占用 AT 通道。
+static constexpr size_t APDU_RESPONSE_DATA_MAX = 32 * 1024;
+static constexpr size_t GET_RESPONSE_CHAIN_MAX = 256;
+static constexpr size_t GET_RESPONSE_NO_PROGRESS_MAX = 4;
 
 using idf_esim_internal::Tlv;
 using idf_esim_internal::append_tlv;
@@ -472,6 +474,7 @@ private:
     {
         std::vector<uint8_t> resp = first;
         size_t get_response_count = 0;
+        size_t no_progress_count = 0;
         while (true) {
             uint16_t sw = response_sw(resp);
             if (sw == 0) {
@@ -480,9 +483,14 @@ private:
             }
             size_t data_len = resp.size() - 2;
             if (out.size() + data_len > APDU_RESPONSE_DATA_MAX) {
-                message = "APDU 响应过大";
+                char buf[96];
+                snprintf(buf, sizeof(buf), "APDU 响应过大(%u/%u字节)",
+                         static_cast<unsigned>(out.size() + data_len),
+                         static_cast<unsigned>(APDU_RESPONSE_DATA_MAX));
+                message = buf;
                 return ESP_ERR_NO_MEM;
             }
+            size_t previous_out_size = out.size();
             out.insert(out.end(), resp.begin(), resp.end() - 2);
             // 91xx 表示命令已成功且模组将执行 SIM REFRESH；SW2 是主动命令长度，不是错误码。
             if (response_sw_ok(sw)) return ESP_OK;
@@ -490,8 +498,20 @@ private:
                 message = status_word_text(sw);
                 return ESP_FAIL;
             }
+            if (out.size() == previous_out_size) {
+                if (++no_progress_count > GET_RESPONSE_NO_PROGRESS_MAX) {
+                    message = "APDU 分段响应无进展";
+                    return ESP_FAIL;
+                }
+            } else {
+                no_progress_count = 0;
+            }
             if (++get_response_count > GET_RESPONSE_CHAIN_MAX) {
-                message = "APDU 分段响应过多";
+                char buf[96];
+                snprintf(buf, sizeof(buf), "APDU 分段响应过多(%u段/%u字节)",
+                         static_cast<unsigned>(get_response_count),
+                         static_cast<unsigned>(out.size()));
+                message = buf;
                 return ESP_FAIL;
             }
 
@@ -1028,6 +1048,14 @@ static esp_err_t read_lpa_preflight(EsimApduSession& session,
     err = session.exchange_store_data(make_empty_request(0x22), raw, message);
     if (err != ESP_OK) return err;
     if (!idf_esim_internal::parse_euicc_info2(raw, info2, message)) return ESP_FAIL;
+    idf_logf("eSIM 下载前置检查: profileVersion=%s svn=%s firmware=%s freeNv=%u freeRam=%u additionalProfile=%d testProfile=%d",
+             info2.profileVersion.c_str(),
+             info2.svn.c_str(),
+             info2.firmwareVersion.c_str(),
+             static_cast<unsigned>(info2.freeNonVolatileMemory),
+             static_cast<unsigned>(info2.freeVolatileMemory),
+             info2.additionalProfile ? 1 : 0,
+             info2.testProfileSupport ? 1 : 0);
     return ESP_OK;
 }
 
@@ -1236,7 +1264,7 @@ IdfEsimLpaBppSession::~IdfEsimLpaBppSession()
 
 esp_err_t IdfEsimLpaBppSession::begin_segment(std::string& safe_message)
 {
-    close();
+    if (impl_) return ESP_OK;
     auto* impl = new (std::nothrow) IdfEsimLpaBppSessionImpl();
     if (!impl) {
         safe_message = "BPP segment 会话内存不足";

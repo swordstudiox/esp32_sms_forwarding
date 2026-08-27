@@ -1,10 +1,9 @@
-# ESP-IDF 6 / Mbed TLS: parse all syntactically valid certificate policy OIDs.
+# ESP-IDF / Mbed TLS: parse all syntactically valid certificate policy OIDs.
 # Reason: GSMA RSP certificatePolicies otherwise returns
 # MBEDTLS_ERR_X509_FEATURE_UNAVAILABLE (0x2080) during TLS peer-chain parsing.
 # Upstream reference: Mbed TLS PR #10616, commit 482fd6a.
 # This patch intentionally does not alter TLS verification or unknown-critical-extension handling.
 diff --git a/library/x509_crt.c b/library/x509_crt.c
-index 3232760ea2..1f1716c219 100644
 --- a/library/x509_crt.c
 +++ b/library/x509_crt.c
 @@ -732,14 +732,14 @@ static int x509_get_authority_key_id(unsigned char **p,
@@ -25,10 +24,10 @@ index 3232760ea2..1f1716c219 100644
      size_t len;
      mbedtls_asn1_buf *buf;
      mbedtls_asn1_sequence *cur = certificate_policies;
-@@ -787,17 +787,6 @@ static int x509_get_certificate_policies(unsigned char **p,
+@@ -787,17 +787,5 @@ static int x509_get_certificate_policies(unsigned char **p,
          policy_oid.len = len;
          policy_oid.p = *p;
-
+-
 -        /*
 -         * Only AnyPolicy is currently supported when enforcing policy.
 -         */
@@ -43,97 +42,10 @@ index 3232760ea2..1f1716c219 100644
          /* Allocate and assign next pointer */
          if (cur->buf.p != NULL) {
              if (cur->next != NULL) {
-@@ -851,7 +840,7 @@ static int x509_get_certificate_policies(unsigned char **p,
+@@ -851,5 +839,4 @@ static int x509_get_certificate_policies(unsigned char **p,
                                   MBEDTLS_ERR_ASN1_LENGTH_MISMATCH);
      }
-
+-
 -    return parse_ret;
 +    return 0;
  }
-
- /*
-@@ -866,7 +855,7 @@ static int x509_get_crt_ext(unsigned char **p,
- {
-     int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
-     size_t len;
--    unsigned char *end_ext_data, *start_ext_octet, *end_ext_octet;
-+    unsigned char *end_ext_data, *end_ext_octet;
-
-     if (*p == end) {
-         return 0;
-@@ -917,7 +906,6 @@ static int x509_get_crt_ext(unsigned char **p,
-             return MBEDTLS_ERROR_ADD(MBEDTLS_ERR_X509_INVALID_EXTENSIONS, ret);
-         }
-
--        start_ext_octet = *p;
-         end_ext_octet = *p + len;
-
-         if (end_ext_octet != end_ext_data) {
-@@ -1018,29 +1006,13 @@ static int x509_get_crt_ext(unsigned char **p,
-                 break;
-
-             case MBEDTLS_X509_EXT_CERTIFICATE_POLICIES:
--                /* Parse certificate policies type */
--                if ((ret = x509_get_certificate_policies(p, end_ext_octet,
--                                                         &crt->certificate_policies)) != 0) {
--                    /* Give the callback (if any) a chance to handle the extension
--                     * if it contains unsupported policies */
--                    if (ret == MBEDTLS_ERR_X509_FEATURE_UNAVAILABLE && cb != NULL &&
--                        cb(p_ctx, crt, &extn_oid, is_critical,
--                           start_ext_octet, end_ext_octet) == 0) {
--                        break;
--                    }
--
--                    if (is_critical) {
--                        return ret;
--                    } else
--                    /*
--                     * If MBEDTLS_ERR_X509_FEATURE_UNAVAILABLE is returned, then we
--                     * cannot interpret or enforce the policy. However, it is up to
--                     * the user to choose how to enforce the policies,
--                     * unless the extension is critical.
--                     */
--                    if (ret != MBEDTLS_ERR_X509_FEATURE_UNAVAILABLE) {
--                        return ret;
--                    }
-+                /* Parse certificate policies type.
-+                 * Per RFC 5280 4.2.1.4, policy enforcement is
-+                 * left to the application. */
-+                if ((ret = x509_get_certificate_policies(
-+                         p, end_ext_octet,
-+                         &crt->certificate_policies)) != 0) {
-+                    return ret;
-                 }
-                 break;
-
-@@ -1713,18 +1685,27 @@ static int x509_info_ext_key_usage(char **buf, size_t *size,
- }
-
- static int x509_info_cert_policies(char **buf, size_t *size,
--                                   const mbedtls_x509_sequence *certificate_policies)
-+                                   const mbedtls_x509_sequence
-+                                   *certificate_policies)
- {
-     int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
-     const char *desc;
-+    char numstr[128];
-     size_t n = *size;
-     char *p = *buf;
-     const mbedtls_x509_sequence *cur = certificate_policies;
-     const char *sep = "";
-
-     while (cur != NULL) {
--        if (mbedtls_x509_oid_get_certificate_policies(&cur->buf, &desc) != 0) {
--            desc = "???";
-+        if (mbedtls_x509_oid_get_certificate_policies(
-+                &cur->buf, &desc) != 0) {
-+            if (mbedtls_oid_get_numeric_string(
-+                    numstr, sizeof(numstr),
-+                    &cur->buf) > 0) {
-+                desc = numstr;
-+            } else {
-+                desc = "???";
-+            }
-         }
-
-         ret = mbedtls_snprintf(p, n, "%s%s", sep, desc);
