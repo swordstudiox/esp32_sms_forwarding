@@ -1236,7 +1236,7 @@ IdfEsimLpaBppSession::~IdfEsimLpaBppSession()
 
 esp_err_t IdfEsimLpaBppSession::begin_segment(std::string& safe_message)
 {
-    close();
+    if (impl_) return ESP_OK;
     auto* impl = new (std::nothrow) IdfEsimLpaBppSessionImpl();
     if (!impl) {
         safe_message = "BPP segment 会话内存不足";

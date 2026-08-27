@@ -1444,10 +1444,8 @@ public:
 
     esp_err_t begin(std::string& message)
     {
-        close();
-        pending_size_ = 0;
-        block_number_ = 0;
-        clear_sensitive_bytes(last_response_);
+        if (active_) close();
+        reset_segment_state();
         active_ = true;
         esp_err_t err = session_.begin_segment(message);
         if (err != ESP_OK) active_ = false;
@@ -1498,23 +1496,28 @@ public:
         }
         esp_err_t err = flush(true, message);
         if (err == ESP_OK) response = std::move(last_response_);
-        close();
+        reset_segment_state();
         return err;
     }
 
     void close()
     {
         session_.close();
+        reset_segment_state();
+        clear_sensitive_bytes(last_response_);
+    }
+
+private:
+    void reset_segment_state()
+    {
         active_ = false;
         volatile uint8_t* pending_bytes = pending_.data();
         for (size_t i = 0; i < pending_.size(); ++i) pending_bytes[i] = 0;
         pending_size_ = 0;
         segment_bytes_ = 0;
         block_number_ = 0;
-        clear_sensitive_bytes(last_response_);
     }
 
-private:
     esp_err_t flush(bool last, std::string& message)
     {
         if (pending_size_ == 0 || block_number_ > 0xFFU) {
