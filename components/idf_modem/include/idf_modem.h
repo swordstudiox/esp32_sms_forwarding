@@ -59,6 +59,8 @@ esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* me
                                            const char* content_type, const std::string& body,
                                            const IdfCellularHttpConfig& config,
                                            IdfCellularHttpResult& result);
+// 写入/恢复 CID 1 PDP APN 定义并刷新状态缓存；不会激活蜂窝数据 PDP。
+esp_err_t idf_modem_apply_apn_context(const std::string& apn);
 esp_err_t idf_modem_request_reset(bool hard_reset);
 // 请求模组任务重新检查 SIM 锁；allow_puk=true 仅用于网页二次确认后的单次 PUK 操作。
 esp_err_t idf_modem_request_sim_unlock(bool allow_puk);

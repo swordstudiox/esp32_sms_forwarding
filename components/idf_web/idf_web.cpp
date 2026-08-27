@@ -1139,12 +1139,6 @@ static bool plmn_valid(const std::string& plmn)
     return true;
 }
 
-static bool apn_valid_for_at(const std::string& apn)
-{
-    return apn.size() <= 96 && apn.find('"') == std::string::npos &&
-           apn.find('\r') == std::string::npos && apn.find('\n') == std::string::npos;
-}
-
 struct ModemApplyTaskArg {
     bool dataChanged = false;
     bool operatorChanged = false;
@@ -1213,17 +1207,15 @@ static void modem_apply_task(void* raw)
     }
 
     if (data_changed) {
+        esp_err_t apn_err = idf_modem_apply_apn_context(apn);
+        if (apn_err != ESP_OK) {
+            idf_logf("APN context 应用失败: %s", esp_err_to_name(apn_err));
+        }
         if (data_enabled && !roaming_enabled && modem.ceregStat == 5) {
             // 数据漫游关闭且当前漫游：仅不激活数据 PDP；短信可用性由 SIM、模组与运营商网络共同决定
             idf_modem_send_at("AT+CGACT=0,1", 5000, resp);
             idf_log_line("数据漫游已关闭：当前处于漫游，未激活蜂窝数据(不跑流量)");
         } else if (data_enabled) {
-            if (!apn.empty() && apn_valid_for_at(apn)) {
-                std::string cmd = "AT+CGDCONT=1,\"IP\",\"" + apn + "\"";
-                idf_modem_send_at(cmd, 3000, resp);
-            } else if (!apn.empty()) {
-                idf_log_line("APN 包含非法字符，未下发 CGDCONT");
-            }
             idf_modem_send_at("AT+CGACT=1,1", 10000, resp);
             std::string ip_resp;
             idf_modem_send_at("AT+CGPADDR=1", 3000, ip_resp);

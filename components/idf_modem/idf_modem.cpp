@@ -432,6 +432,13 @@ static void set_status_cell_ip(const std::string& ip)
     xSemaphoreGive(s_status_mutex);
 }
 
+static void set_status_apn_sim(const std::string& apn)
+{
+    if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+    s_status.apnSim = apn;
+    xSemaphoreGive(s_status_mutex);
+}
+
 static std::string read_nvs_string(nvs_handle_t nvs, const char* key, size_t max_len)
 {
     size_t len = 0;
@@ -1021,6 +1028,27 @@ static std::string parse_apn(const std::string& resp)
             }
         }
         pos = p + strlen("+CGDCONT:");
+    }
+}
+
+static bool parse_cgact_active(const std::string& resp, int cid, bool& active)
+{
+    size_t pos = 0;
+    while (true) {
+        size_t p = resp.find("+CGACT:", pos);
+        if (p == std::string::npos) return false;
+        std::string line = line_containing(resp, p);
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            long values[2] = {0, 0};
+            int count = 0;
+            if (parse_comma_longs(line.substr(colon + 1), values, 2, count) &&
+                count >= 2 && values[0] == cid) {
+                active = values[1] != 0;
+                return true;
+            }
+        }
+        pos = p + strlen("+CGACT:");
     }
 }
 
@@ -1617,48 +1645,96 @@ static bool model_skips_cgact(void)
     return model == "ML307Y";
 }
 
+static esp_err_t refresh_apn_context_status(std::string* current_apn = nullptr)
+{
+    std::string resp;
+    if (!send_ok("AT+CGDCONT?", 1500, &resp)) return ESP_FAIL;
+    std::string apn = parse_apn(resp);
+    set_status_apn_sim(apn);
+    if (current_apn) *current_apn = apn;
+    return ESP_OK;
+}
+
+static bool deactivate_cellular_data_if_active(uint32_t timeout_ms, const char* reason)
+{
+    std::string resp;
+    bool active = false;
+    bool known = false;
+    if (send_ok("AT+CGACT?", 1500, &resp)) {
+        known = parse_cgact_active(resp, 1, active);
+    }
+    if (known && !active) {
+        set_status_cell_ip("");
+        return true;
+    }
+
+    bool ok = send_ok("AT+CGACT=0,1", timeout_ms, &resp);
+    if (ok) {
+        set_status_cell_ip("");
+        if (reason && reason[0]) idf_log_line(reason);
+    }
+    return ok;
+}
+
+static esp_err_t apply_configured_apn_context(const std::string& apn, const char* invalid_message)
+{
+    esp_err_t err = ESP_OK;
+    std::string resp;
+    if (apn.empty()) {
+        // 空 APN 表示恢复运营商/模组自动 PDP APN；先保留 CID 1 和 PDP type，
+        // 若该固件不接受空 APN，再退回删除 CID 1 context。
+        err = idf_modem_send_at("AT+CGDCONT=1,\"IP\",\"\"", 3000, resp);
+        if (err != ESP_OK) err = idf_modem_send_at("AT+CGDCONT=1", 3000, resp);
+        if (err == ESP_OK) return refresh_apn_context_status(nullptr);
+        return err;
+    }
+    if (!apn_valid_for_at(apn)) {
+        if (invalid_message && invalid_message[0]) idf_log_line(invalid_message);
+        return ESP_ERR_INVALID_ARG;
+    }
+    std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
+    cmd += apn;
+    cmd += "\"";
+    err = idf_modem_send_at(cmd, 3000, resp);
+    if (err == ESP_OK) return refresh_apn_context_status(nullptr);
+    return err;
+}
+
 static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint32_t active_timeout_ms,
                                             uint32_t inactive_timeout_ms)
 {
     std::string resp;
     std::string apn = idf_util_trim_copy(cfg.apn);
+    esp_err_t apn_err = apply_configured_apn_context(apn, "APN 包含非法字符，启动时未下发 CGDCONT");
+    if (apn_err != ESP_OK) {
+        idf_logf("启动时下发 APN context 未成功: %s", esp_err_to_name(apn_err));
+    }
     // 数据漫游策略：未勾选"允许数据漫游"且当前处于漫游(CEREG=5)时不激活蜂窝数据。
     // 启动阶段注册状态未知(stat=-1)会乐观激活，注册完成后由 enforce_roaming_data_policy 兜底关闭。
     bool want_data = cfg.dataEnabled &&
                      (cfg.roamingEnabled || idf_modem_get_status().ceregStat != 5);
     if (want_data) {
-        if (!apn.empty() && apn_valid_for_at(apn)) {
-            std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
-            cmd += apn;
-            cmd += "\"";
-            send_ok(cmd.c_str(), 3000, &resp);
-        } else if (!apn.empty()) {
-            idf_log_line("APN 包含非法字符，启动时未下发 CGDCONT");
-        }
         send_ok("AT+CGACT=1,1", active_timeout_ms, &resp);
         // 已激活的 PDP 在部分固件上会对重复 CGACT 返回 ERROR；实际拿到 IP 才算可用。
         return sample_cell_ip_once();
     }
 
-    bool ok = send_ok("AT+CGACT=0,1", inactive_timeout_ms, &resp);
-    if (ok) set_status_cell_ip("");
-    return ok;
+    return deactivate_cellular_data_if_active(inactive_timeout_ms, nullptr);
 }
 
-// 数据漫游策略兜底：未勾选"允许数据漫游"且当前漫游(stat=5)时确保蜂窝数据关闭。
-// 启动阶段拿不到注册状态会先乐观激活，注册完成后在此关闭，避免漫游误跑流量。
+// 蜂窝数据策略兜底：配置禁用数据时无条件确保 PDP 关闭；未允许数据漫游且
+// 当前漫游(stat=5)时也确保 PDP 关闭。短信驻网不依赖 PDP 数据承载。
 // 此开关只控制数据 PDP；短信是否可用由 SIM、模组和运营商短信承载共同决定，
 // 不能仅凭 CEREG/CREG 中的某一个状态判断。归属网络(stat=1)不干预，按常规激活。
 static void enforce_roaming_data_policy(const IdfSimSettingsView& cfg, int stat)
 {
-    if (!cfg.dataEnabled || cfg.roamingEnabled) return;  // 未开数据或允许漫游数据：无需干预
-    if (stat != 5) return;                                // 非漫游：归属网络按常规激活即可
-    if (idf_modem_get_status().cellIp.empty()) return;    // 数据本就未激活，无需再关
-    std::string resp;
-    if (send_ok("AT+CGACT=0,1", 3000, &resp)) {
-        set_status_cell_ip("");
-        idf_log_line("数据漫游已关闭：检测到漫游，已停用蜂窝数据(不跑流量)");
+    if (!cfg.dataEnabled) {
+        deactivate_cellular_data_if_active(3000, "蜂窝数据已关闭：配置禁用，已停用 PDP 数据连接(不跑流量)");
+        return;
     }
+    if (cfg.roamingEnabled) return;  // 允许漫游数据：无需干预
+    if (stat != 5) return;           // 非漫游：归属网络按常规激活即可
+    deactivate_cellular_data_if_active(3000, "数据漫游已关闭：检测到漫游，已停用蜂窝数据(不跑流量)");
 }
 
 static void schedule_data_mode_retry(void)
@@ -1929,6 +2005,8 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
                        before.fwver.empty();
     std::string resp;
     IdfModemStatus patch;
+    bool apn_sampled = false;
+    std::string sampled_apn;
 
     // 固件/厂家信息基本不变；启动采样未完整前允许补采，完整后不再反复查询。
     if (need_static && before.mfr.empty()) {
@@ -1972,10 +2050,12 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
             if (send_ok("AT+COPS?", 1500, &resp)) patch.operatorName = parse_cops(resp);
             vTaskDelay(pdMS_TO_TICKS(150));
         }
-        if (before.apnSim.empty()) {
-            if (send_ok("AT+CGDCONT?", 1500, &resp)) patch.apnSim = parse_apn(resp);
-            vTaskDelay(pdMS_TO_TICKS(150));
+        if (send_ok("AT+CGDCONT?", 1500, &resp)) {
+            sampled_apn = parse_apn(resp);
+            patch.apnSim = sampled_apn;
+            apn_sampled = true;
         }
+        vTaskDelay(pdMS_TO_TICKS(150));
         if (before.phone.empty()) {
             if (send_ok("AT+CNUM", 1500, &resp)) patch.phone = parse_cnum_phone(resp);
             if (patch.phone.empty()) patch.phone = read_own_number_phonebook();
@@ -1989,13 +2069,14 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
                           (!patch.iccid.empty() && patch.iccid != before.iccid) ||
                           (!patch.imsi.empty() && patch.imsi != before.imsi);
     bool network_changed = (!patch.operatorName.empty() && patch.operatorName != before.operatorName) ||
-                           (!patch.apnSim.empty() && patch.apnSim != before.apnSim) ||
+                           (apn_sampled && sampled_apn != before.apnSim) ||
                            (!patch.phone.empty() && patch.phone != before.phone);
     bool material_static_change = (!patch.imei.empty() && !before.imei.empty() && patch.imei != before.imei) ||
                                   (!patch.iccid.empty() && !before.iccid.empty() && patch.iccid != before.iccid) ||
                                   (!patch.imsi.empty() && !before.imsi.empty() && patch.imsi != before.imsi);
     bool changed = static_changed || network_changed;
     update_status(patch, true, false);
+    if (apn_sampled) set_status_apn_sim(sampled_apn);
     IdfModemStatus after = idf_modem_get_status();
     s_identity_static_attempted = !after.mfr.empty() && !after.model.empty() && !after.fwver.empty();
     if (include_network_fields) {
@@ -2767,6 +2848,13 @@ IdfModemStatus idf_modem_get_status(void)
         xSemaphoreGive(s_status_mutex);
     }
     return copy;
+}
+
+esp_err_t idf_modem_apply_apn_context(const std::string& apn)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    std::string value = idf_util_trim_copy(apn);
+    return apply_configured_apn_context(value, "APN 包含非法字符，未下发 CGDCONT");
 }
 
 esp_err_t idf_modem_write_own_number(const std::string& phone_raw, std::string& message)

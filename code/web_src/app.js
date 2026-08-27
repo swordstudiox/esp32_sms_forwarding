@@ -1344,8 +1344,9 @@
       return v || ((d && d.modemInitPhase === 'sampling') ? '读取中' : (fresh ? '--' : (Date.now() < modemSampleUntil ? '采样中' : '未刷新')));
     }
     function apnText(d) {
-      if (d.apnSim) return d.apnSim;
-      if (d.apn) return d.apn;
+      if (d.apnSim && d.apn && d.apnSim !== d.apn) return d.apnSim + '（模组 PDP，配置：' + d.apn + '）';
+      if (d.apnSim) return d.apnSim + '（模组 PDP）';
+      if (d.apn) return d.apn + '（手动配置）';
       if (d && d.modemInitPhase === 'sampling') return '读取中';
       if (Date.now() < modemSampleUntil && !d.identityFresh) return '采样中';
       if (!d.identityFresh && d.modemReady) return '未刷新';
