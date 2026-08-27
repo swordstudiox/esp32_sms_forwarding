@@ -84,9 +84,10 @@ Web UI 提供独立的定时任务页，既能做 SIM 保号，也能做系统�
 
 - 可读取 eSIM Profile 列表。
 - 可查看 Profile 标识、昵称、状态等信息。
+- 可通过 Activation Code 下载并写入 eSIM Profile；已在真实 eUICC 上完成写入验证。
 - 可启用指定 Profile，实现切卡/换卡。
 - 支持任务里选择目标 Profile，并在任务后按配置切回原 Profile。
-- eSIM 操作走模组 AT / APDU 能力，具体可用性取决于模组固件、卡片和运营商 Profile 支持情况。
+- eSIM 下载和管理操作走模组 AT / APDU 与 GSMA RSP ES9+ HTTPS 链路，具体可用性取决于模组固件、卡片容量、证书链和运营商 SM-DP+ 服务支持情况。
 
 ### Web 管理
 
@@ -196,7 +197,7 @@ Web 侧数据流：
 | `smsdata` | 640KB | 短信、收件箱等本地数据，使用 NVS 磨损均衡与掉电原子写入 |
 | `coredump` | 64KB | 崩溃转储，便于定位无人值守设备的异常 |
 
-`app0`/`app1` 保留双 OTA 槽位，每个槽位 1.625MiB。ESP-IDF 6.0.2 构建的当前固件约 1.22MiB，单槽剩余约 25%（约 417KiB），可继续容纳后续 eSIM、诊断和 UI 功能。`smsdata` 单独放大，避免短信留存和普通配置共用很小的 NVS 空间。
+`app0`/`app1` 保留双 OTA 槽位，每个槽位 1.625MiB。ESP-IDF 5.5.4 本地构建的当前固件约 1.29MiB，单槽剩余约 20%（约 338KiB），可继续容纳后续诊断和 UI 功能，但新增 eSIM/HTTPS 能力时需要继续关注体积余量。`smsdata` 单独放大，避免短信留存和普通配置共用很小的 NVS 空间。
 
 ## 体积与内存优化
 
