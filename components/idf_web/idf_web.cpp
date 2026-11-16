@@ -26,6 +26,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "idf_config.h"
+#include "idf_daily_heartbeat.h"
 #include "idf_esim.h"
 #include "idf_inbox.h"
 #include "idf_lpa.h"
@@ -356,7 +357,12 @@ static esp_err_t handle_ui_panel(httpd_req_t* req)
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Unknown panel");
         return ESP_OK;
     }
-    return send_gzip_asset(req, *asset, "no-store, max-age=0");
+    // 模板不含配置数据，只有与固件匹配的版本 URL 才能长期缓存；旧版本必须重新校验。
+    char version[24] = {};
+    const bool version_matches = httpd_query_key_value(query, "v", version, sizeof(version)) == ESP_OK &&
+                                 strcmp(version, WEB_ASSET_HASH) == 0;
+    return send_gzip_asset(req, *asset, version_matches ? "private, max-age=31536000, immutable" :
+                                                      "private, no-cache, max-age=0");
 }
 
 static esp_err_t handle_status(httpd_req_t* req)
@@ -490,6 +496,11 @@ static esp_err_t handle_status(httpd_req_t* req)
     json_prop(body, "imei", modem.imei); body += ",";
     json_prop(body, "iccid", modem.iccid); body += ",";
     json_prop(body, "imsi", modem.imsi);
+    snprintf(buf, sizeof(buf),
+             ",\"modemSampleRequested\":%lu,\"modemSampleCompleted\":%lu,\"modemSampleRunning\":%s",
+             static_cast<unsigned long>(modem.sampleRequested),
+             static_cast<unsigned long>(modem.sampleCompleted), modem.sampleRunning ? "true" : "false");
+    body += buf;
     float temp = 0;
     if (read_chip_temp(temp)) {
         snprintf(buf, sizeof(buf), ",\"chipTemp\":%.1f}", static_cast<double>(temp));
@@ -1069,19 +1080,9 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
             message = resp.empty() ? esp_err_to_name(err) : resp;
         }
     } else if (action == "operator") {
-        std::string resp;
-        // 先选长名称格式，否则自动模式下 COPS? 只回模式位(+COPS: 0)，读不到运营商名
-        idf_modem_send_at("AT+COPS=3,0", 3000, resp);
-        esp_err_t err = idf_modem_send_at("AT+COPS?", 5000, resp);
-        std::string line = first_line_containing(resp, "+COPS:");
-        if (err == ESP_OK && !line.empty()) {
-            size_t q1 = line.find('"');
-            size_t q2 = q1 == std::string::npos ? std::string::npos : line.find('"', q1 + 1);
-            message = (q1 != std::string::npos && q2 != std::string::npos) ? line.substr(q1 + 1, q2 - q1 - 1) : line;
-            success = true;
-        } else {
-            message = resp.empty() ? esp_err_to_name(err) : resp;
-        }
+        esp_err_t err = idf_modem_get_operator(message);
+        success = err == ESP_OK && !message.empty();
+        if (!success) message = std::string("无法读取当前驻网运营商: ") + esp_err_to_name(err);
     } else if (action == "imei") {
         std::string imei;
         esp_err_t err = idf_modem_get_imei(imei);
@@ -2263,6 +2264,44 @@ static esp_err_t handle_test_push(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
+static esp_err_t handle_test_rule(httpd_req_t* req)
+{
+    if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
+
+    std::string raw;
+    if (read_body(req, raw, 16384) != ESP_OK) return ESP_OK;
+    IdfFormFields fields = parse_urlencoded(raw);
+    std::string rules = field_text(fields, "rules");
+    std::string sender = field_text(fields, "sender");
+    std::string text = field_text(fields, "text");
+    set_json_no_cache(req);
+
+    if (rules.size() > 2048 || sender.size() > 128 || text.size() > 4096) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"规则或测试内容过长\"}");
+    }
+
+    std::string validation_error;
+    if (idf_config_validate_forward_rules(rules, &validation_error) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        std::string body = "{\"success\":false,";
+        json_prop(body, "message", validation_error.empty() ? "转发规则格式无效" : validation_error);
+        body += "}";
+        return httpd_resp_send(req, body.data(), body.size());
+    }
+
+    IdfForwardRuleDecision decision = idf_push_eval_forward_rules(rules, sender, text);
+    char body[192];
+    snprintf(body, sizeof(body),
+             "{\"success\":true,\"matched\":%s,\"drop\":%s,\"email\":%s,\"chMask\":%u,\"ruleIndex\":%d}",
+             decision.matched ? "true" : "false",
+             decision.drop ? "true" : "false",
+             decision.email ? "true" : "false",
+             static_cast<unsigned>(decision.chMask), decision.ruleIndex);
+    return httpd_resp_sendstr(req, body);
+}
+
 static esp_err_t handle_test_smtp(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
@@ -2724,16 +2763,32 @@ static std::string keepalive_profile_note(const IdfKeepaliveRunView& cfg)
     return std::string("目标 eSIM: ") + idf_esim_mask_profile_id(cfg.kaProfile);
 }
 
-static void enqueue_maintenance_notice(int tz_offset_min, bool email_enabled, const char* title,
-                                       const std::string& body, uint32_t now)
+static IdfHeartbeatEnqueueResult enqueue_maintenance_notice_detailed(
+    int tz_offset_min, bool email_enabled, const char* title,
+    const std::string& body, uint32_t now)
 {
     std::string ts = format_epoch_local(now, tz_offset_min);
-    int pushed = idf_push_enqueue_notify(title, body.c_str(), ts.c_str());
+    int push_targets = 0;
+    int pushed = idf_push_enqueue_notify(title, body.c_str(), ts.c_str(), &push_targets);
     if (pushed > 0) idf_logf("%s推送已入队: %d 个通道", title, pushed);
-    else idf_logf("%s无有效推送通道", title);
 
-    if (!email_enabled) return;
-    idf_push_enqueue_email(title, body.c_str());
+    bool email_target = email_enabled && idf_config_email_configured();
+    bool emailed = email_target && idf_push_enqueue_email(title, body.c_str());
+    if (pushed > 0 || emailed) return IdfHeartbeatEnqueueResult::queued;
+
+    if (push_targets > 0 || email_target) {
+        idf_logf("%s通知目标暂时繁忙，稍后重试", title);
+        return IdfHeartbeatEnqueueResult::busy;
+    }
+    idf_logf("%s无有效通知目标，本日不再重试", title);
+    return IdfHeartbeatEnqueueResult::no_target;
+}
+
+static bool enqueue_maintenance_notice(int tz_offset_min, bool email_enabled, const char* title,
+                                       const std::string& body, uint32_t now)
+{
+    return enqueue_maintenance_notice_detailed(tz_offset_min, email_enabled, title, body, now) ==
+           IdfHeartbeatEnqueueResult::queued;
 }
 
 static void keepalive_set_job_message(const std::string& message)
@@ -3153,9 +3208,31 @@ static void sched_task_worker(void* arg_raw)
 
     std::string message;
     bool ok = false;
+    // 先持久化本次执行时间，再做切卡/短信/流量等不可回滚动作。
+    // 原先在动作成功后才写 lastRun：若该次 NVS 提交失败或动作完成后立即掉电，
+    // scheduler 下一小时仍会看到旧基准时间并再次执行，短信等动作会重复扣费。
+    // 这里采用 at-most-once 语义：进度写不进去就取消动作，宁可稍后人工处理，
+    // 也不能在无法记账的情况下继续产生外部副作用。
+    uint32_t started_at = static_cast<uint32_t>(time(nullptr));
+    bool progress_claimed = false;
+    if (!epoch_valid(started_at)) {
+        message = "设备时间未同步，已取消定时任务";
+        idf_logf("定时任务取消: %s: %s", label.c_str(), message.c_str());
+    } else {
+        esp_err_t claim_err = idf_config_set_sched_last_if_matches(index, t, started_at);
+        if (claim_err == ESP_OK) {
+            progress_claimed = true;
+        } else {
+            message = claim_err == ESP_ERR_INVALID_STATE
+                ? "任务配置已变化，已取消旧任务动作"
+                : std::string("执行进度写入失败，已取消动作: ") + esp_err_to_name(claim_err);
+            idf_logf("定时任务取消: %s: %s", label.c_str(), message.c_str());
+        }
+    }
+
     EsimJobSwitch sw;
-    bool prep_ok = true;
-    if (!t.profile.empty()) {
+    bool prep_ok = progress_claimed;
+    if (prep_ok && !t.profile.empty()) {
         sched_set_job_message(label + ": 正在切换 eSIM Profile");
         std::string prep_msg;
         prep_ok = esim_prepare_profile(t.profile, sw, prep_msg);
@@ -3176,15 +3253,21 @@ static void sched_task_worker(void* arg_raw)
     }
 
     uint32_t now = static_cast<uint32_t>(time(nullptr));
-    if (epoch_valid(now)) {
-        if (ok) {
-            idf_config_set_sched_last(index, now);
-        } else {
-            // 失败改为"明天重试"：每小时重试会反复切卡/发短信/跑流量，代价太高
-            uint32_t days = t.intervalDays > 0 ? static_cast<uint32_t>(t.intervalDays) : 1u;
-            uint64_t back = static_cast<uint64_t>(days - 1) * 86400ULL;
-            uint32_t base = back < now ? now - static_cast<uint32_t>(back) : now;
-            idf_config_set_sched_last(index, base);
+    if (!ok && progress_claimed && epoch_valid(now)) {
+        // 失败改为"明天重试"：每小时重试会反复切卡/发短信/跑流量，代价太高。
+        // 若退避进度写入失败，保留动作前已写入的 started_at，避免重新落入重复执行。
+        uint32_t days = t.intervalDays > 0 ? static_cast<uint32_t>(t.intervalDays) : 1u;
+        uint64_t back = static_cast<uint64_t>(days - 1) * 86400ULL;
+        uint32_t base = back < now ? now - static_cast<uint32_t>(back) : now;
+        IdfSchedTask claimed_task = t;
+        claimed_task.lastRun = started_at;
+        esp_err_t retry_err = idf_config_set_sched_last_if_matches(index, claimed_task, base);
+        if (retry_err == ESP_ERR_INVALID_STATE) {
+            idf_logf("定时任务%d配置已变化，跳过旧任务失败退避", index + 1);
+        } else if (retry_err != ESP_OK) {
+            idf_logf("定时任务%d失败退避写入失败，保留本次执行时间: %s",
+                     index + 1, esp_err_to_name(retry_err));
+            message += std::string("；次日重试进度写入失败: ") + esp_err_to_name(retry_err);
         }
     }
 
@@ -3279,24 +3362,45 @@ static int64_t load_daily_last_day(const char* key)
     return day;
 }
 
-static void store_daily_last_day(const char* key, int64_t day)
+static bool store_daily_last_day(const char* key, int64_t day)
 {
     nvs_handle_t h;
-    if (nvs_open("sms_state", NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_u32(h, key, static_cast<uint32_t>(day));
-    nvs_commit(h);
+    esp_err_t err = nvs_open("sms_state", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        idf_logf("每日状态记账打开失败(%s): %s", key, esp_err_to_name(err));
+        return false;
+    }
+    if (day < 0) {
+        err = nvs_erase_key(h, key);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+    } else {
+        err = nvs_set_u32(h, key, static_cast<uint32_t>(day));
+    }
+    if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
+    if (err != ESP_OK) idf_logf("每日状态记账失败(%s): %s", key, esp_err_to_name(err));
+    return err == ESP_OK;
 }
 
 static void scheduler_task(void*)
 {
     uint32_t last_ka_check_ms = 0;
+    uint64_t last_push_worker_retry_ms = 0;
     bool prev_ka_enabled = false;
-    int64_t hb_last_day = load_daily_last_day("hb_day");
+    IdfDailyHeartbeat heartbeat(load_daily_last_day("hb_day"));
+    bool heartbeat_waiting_for_time = false;
     int64_t health_last_day = load_daily_last_day("health_day");
     int64_t rb_last_day = -1;
 
     while (true) {
+        uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+        if (!idf_push_ready() &&
+            (last_push_worker_retry_ms == 0 || uptime_ms - last_push_worker_retry_ms >= 60000ULL)) {
+            last_push_worker_retry_ms = uptime_ms;
+            esp_err_t push_err = idf_push_start();
+            idf_logf("推送后台 worker 恢复%s: %s",
+                     push_err == ESP_OK ? "成功" : "失败", esp_err_to_name(push_err));
+        }
         // —— 低堆守护：无条件运行(5s 周期)。放在 NTP 门控里的话，配网模式/断网
         // 期间恰恰是最容易内存紧张的场景，却完全失去自愈能力 ——
         if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < 20000U && system_idle_for_maintenance()) {
@@ -3308,8 +3412,13 @@ static void scheduler_task(void*)
         }
 
         uint32_t now = static_cast<uint32_t>(time(nullptr));
+        IdfSchedulerView cfg = idf_config_get_scheduler_view();
+        bool heartbeat_needs_time = cfg.hbEnabled && !epoch_valid(now);
+        if (heartbeat_needs_time && !heartbeat_waiting_for_time) {
+            idf_log_line("每日心跳等待时间同步，请检查 WiFi/NTP 与时区设置");
+        }
+        heartbeat_waiting_for_time = heartbeat_needs_time;
         if (epoch_valid(now)) {
-            IdfSchedulerView cfg = idf_config_get_scheduler_view();
             uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
 
             // 保号刚被启用时立即检查一次（旧行为），否则按小时节拍
@@ -3344,7 +3453,7 @@ static void scheduler_task(void*)
                     if (!t.enabled || t.intervalDays <= 0) continue;
                     if (!epoch_valid(t.lastRun)) {
                         // 老配置/时间未同步时启用的任务：先建立基准日，不立即执行
-                        idf_config_set_sched_last(i, now);
+                        idf_config_set_sched_last_if_matches(i, t, now);
                         continue;
                     }
                     if (!keepalive_due(t.lastRun, now, static_cast<uint32_t>(t.intervalDays))) continue;
@@ -3376,17 +3485,18 @@ static void scheduler_task(void*)
             int64_t day = local / 86400LL;
             if (local < 0 && (local % 86400LL) != 0) --day;
 
-            // 用 > 而非 !=：NTP 回拨跨过本地午夜会让 day 变小，!= 会当天重复触发
-            if (cfg.hbEnabled && hour == cfg.hbHour && day > hb_last_day) {
-                hb_last_day = day;
-                store_daily_last_day("hb_day", day);
+            heartbeat.poll(cfg.hbEnabled, cfg.hbHour, now, cfg.tzOffsetMin,
+                           static_cast<uint64_t>(esp_timer_get_time() / 1000ULL), [&]() {
                 IdfSmsStatus sms = idf_sms_get_status();
                 char body[192];
                 snprintf(body, sizeof(body), "设备运行正常。\n累计转发: %u 条\n空闲堆: %u KB",
                          static_cast<unsigned>(sms.total),
                          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024U));
-                enqueue_maintenance_notice(cfg.tzOffsetMin, cfg.emailEnabled, "设备每日心跳", body, now);
-            }
+                return enqueue_maintenance_notice_detailed(cfg.tzOffsetMin, cfg.emailEnabled,
+                                                           "设备每日心跳", body, now);
+            }, [](int64_t claimed_day) {
+                return store_daily_last_day("hb_day", claimed_day);
+            });
 
             if (cfg.smsHealthEnabled && hour == cfg.smsHealthHour &&
                 day > health_last_day && idf_modem_at_idle()) {
@@ -3400,7 +3510,6 @@ static void scheduler_task(void*)
                 }
             }
 
-            uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
             if (cfg.rebootEnabled && hour == cfg.rebootHour && day > rb_last_day &&
                 uptime_ms >= 7200000ULL && system_idle_for_maintenance()) {
                 rb_last_day = day;
@@ -4070,6 +4179,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/at", register_handler(s_server, "/at", HTTP_ANY, handle_at));
     IDF_WEB_TRY_REGISTER("/ping", register_handler(s_server, "/ping", HTTP_ANY, handle_ping));
     IDF_WEB_TRY_REGISTER("/testpush", register_handler(s_server, "/testpush", HTTP_ANY, handle_test_push));
+    IDF_WEB_TRY_REGISTER("/testrule", register_handler(s_server, "/testrule", HTTP_POST, handle_test_rule));
     IDF_WEB_TRY_REGISTER("/testsmtp", register_handler(s_server, "/testsmtp", HTTP_ANY, handle_test_smtp));
     IDF_WEB_TRY_REGISTER("/ussd", register_handler(s_server, "/ussd", HTTP_ANY, handle_ussd));
     IDF_WEB_TRY_REGISTER("/flight", register_handler(s_server, "/flight", HTTP_ANY, handle_flight));

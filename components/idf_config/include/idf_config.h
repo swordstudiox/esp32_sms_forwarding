@@ -9,10 +9,10 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
-static constexpr const char* IDF_FW_VERSION = "1.3.3-fork.v1.1.5";
+static constexpr const char* IDF_FW_VERSION = "1.4.0-fork.v1.1.5";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
-static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "http://gg.incrafttime.top/api/payload?size=64342";
+static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "https://gg.incrafttime.top/api/payload?size=64342";
 
 static constexpr int IDF_MAX_SCHED_TASKS = 6;
 
@@ -163,6 +163,8 @@ esp_err_t idf_config_import_text(const std::string& text, int* applied_count);
 esp_err_t idf_config_factory_reset(void);
 esp_err_t idf_config_set_keepalive_last(uint32_t epoch);
 esp_err_t idf_config_set_sched_last(int index, uint32_t epoch);
+// 仅当槽位仍与 expected 完全一致时更新运行进度；用于阻止旧 worker claim 新任务。
+esp_err_t idf_config_set_sched_last_if_matches(int index, const IdfSchedTask& expected, uint32_t epoch);
 esp_err_t idf_config_set_net_led_enabled(bool enabled);
 esp_err_t idf_config_set_call_notify_enabled(bool enabled);
 

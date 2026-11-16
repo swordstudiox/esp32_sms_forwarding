@@ -20,9 +20,11 @@ function Assert-LastExitCode {
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $BuildDir = Join-Path $RepoRoot 'build\idf6'
 $SdkConfig = Join-Path $RepoRoot 'build\sdkconfig.idf6'
+$CcacheDir = Join-Path $RepoRoot 'build\.ccache'
+$CcacheTempDir = Join-Path $RepoRoot 'build\.ccache-tmp'
 
 if ([string]::IsNullOrWhiteSpace($IdfPath)) {
-    $IdfPath = 'E:\Espressif\esp-idf-v6.0.2'
+    $IdfPath = 'E:\Espressif\esp-idf-v5.5.4'
 }
 if ([string]::IsNullOrWhiteSpace($IdfToolsPath)) {
     $IdfToolsPath = 'E:\Espressif\.espressif'
@@ -33,9 +35,11 @@ if (-not (Test-Path -LiteralPath $ExportScript)) {
     throw "ESP-IDF export script not found: $ExportScript"
 }
 
-New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+New-Item -ItemType Directory -Force -Path $BuildDir, $CcacheDir, $CcacheTempDir | Out-Null
 
 $env:IDF_TOOLS_PATH = $IdfToolsPath
+$env:CCACHE_DIR = $CcacheDir
+$env:CCACHE_TEMPDIR = $CcacheTempDir
 . $ExportScript
 
 # 在外部 ESP-IDF 源码上应用项目维护的兼容 patch；由 git apply 严格检查上下文。

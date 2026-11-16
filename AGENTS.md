@@ -18,14 +18,16 @@ powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 ```
 
-The helper loads ESP-IDF 6.0.2, applies the repository-managed Mbed TLS compatibility patch at `patches/mbedtls/`, uses Ninja parallelism, and writes generated files to `build/idf6` with configuration at `build/sdkconfig.idf6`.
+The helper defaults to the locally installed ESP-IDF 5.5.4 at `E:\Espressif\esp-idf-v5.5.4`, applies the applicable repository-managed SDK patches under `patches/`, keeps ccache inside `build/`, uses Ninja parallelism, and writes generated files to `build/idf6` with configuration at `build/sdkconfig.idf6`. The `idf6` directory name is retained for compatibility with existing scripts and artifacts; it does not mean the local SDK is IDF 6.
 
-Required ESP-IDF: **v6.0.2**. The firmware targets Mbed TLS 4 / PSA Crypto and does not maintain ESP-IDF 5.x compatibility. CI uses the fixed `espressif/idf:v6.0.2` image and applies the same patch after checking that its source context applies cleanly.
+Primary local and real-device validation baseline: **ESP-IDF v5.5.4**. The source also retains the upstream ESP-IDF 6.0.2 / Mbed TLS 4 compatibility adaptations, and CI uses the fixed `espressif/idf:v6.0.2` image as a compatibility gate. Do not assume that ESP-IDF 6.0.2 is installed on the local Windows machine. If a different SDK location is used, pass `-IdfPath` / `-IdfToolsPath` explicitly or set the matching environment variables.
 
-For direct Linux `idf.py` use, load the fixed SDK and apply the repository patch first:
+`tools/apply_idf_patches.py` always checks the shared Mbed TLS policy patch. The ESP-IDF 6 cross-signed certificate bundle leak patch is feature-gated and must be skipped on IDF 5.x; do not force IDF 6-only patch context onto the local 5.5.4 SDK.
+
+For direct `idf.py` use, load the intended SDK and apply the repository patch first:
 
 ```bash
-. /home/alex/code/sdk/esp-idf/6.0/export.sh
+. /path/to/esp-idf-v5.5.4/export.sh
 python tools/apply_idf_patches.py --idf-path "$IDF_PATH"
 ```
 

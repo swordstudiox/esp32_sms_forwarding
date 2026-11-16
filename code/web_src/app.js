@@ -3,6 +3,7 @@
     var webConfig = null, webConfigReq = null;
     var loadedPanels = {};
     var panelSeq = 0, currentPanel = '', panelFetchCtrl = null;
+    var ruleTestSeq = 0, ruleTestAbort = null;
 
     function ensureConfig(force) {
       if (force) { webConfig = null; webConfigReq = null; }
@@ -24,6 +25,15 @@
     function jsonOrThrow(r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
+    }
+    function jsonMessageOrThrow(r) {
+      return r.text().then(function(raw) {
+        var data = null;
+        try { data = raw ? JSON.parse(raw) : null; } catch (e) {}
+        if (!r.ok) throw new Error(data && data.message ? data.message : ('HTTP ' + r.status));
+        if (!data) throw new Error('设备未返回有效 JSON');
+        return data;
+      });
     }
     function csrfFetch(url, opt) {
       opt = opt || {};
@@ -111,7 +121,7 @@
       for (var i = 0; i < 5; i++) {
         var item = items[i] || {}, idx = String(i);
         html += '<div class="sim-credential">';
-        html += '<div class="form-group"><label>ICCID ' + (i + 1) + '</label><input class="form-input" name="sim' + idx + 'Iccid" inputmode="numeric" maxlength="22" value="' + htmlEsc(item.iccid || '') + '" placeholder="完整 ICCID；留空删除本行"></div>';
+        html += '<div class="form-group"><label>ICCID ' + (i + 1) + '</label><input class="form-input" name="sim' + idx + 'Iccid" inputmode="text" autocapitalize="characters" spellcheck="false" maxlength="22" value="' + htmlEsc(item.iccid || '') + '" placeholder="完整 ICCID；留空删除本行"></div>';
         html += '<div class="sim-credential-grid">';
         html += '<div class="form-group"><label>PIN</label><input class="form-input" type="password" name="sim' + idx + 'Pin" inputmode="numeric" minlength="4" maxlength="8" autocomplete="new-password" placeholder="' + (item.pinSet ? '已保存，留空不修改' : '4–8 位数字') + '"></div>';
         html += '<div class="form-group"><label>PIN 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PinMax" min="1" max="2" value="' + (item.pinMax || 1) + '"></div>';
@@ -170,6 +180,7 @@
       return html;
     }
     function renderConfigTemplate(html) {
+      if (html.indexOf('%') < 0) return html;
       var c = webConfig || {};
       var map = {
         WEB_USER: htmlEsc(c.webUser || ''), WEB_PASS: htmlEsc(c.webPass || ''),
@@ -179,15 +190,18 @@
         SMTP_CHECK: c.emailConfigured ? '已配置' : '未配置', EMAIL_EN: checked(c.emailEnabled), PUSH_EN: checked(c.pushEnabled),
         MODEM_CHECK: c.modemReady ? '已就绪' : '未就绪', PUSH_COUNT: String(c.pushEnabledCount || 0), INBOX_MAX: String(c.inboxMax || ''),
         NTP: htmlEsc(c.ntpServer || ''), MDNS_HOST: htmlEsc(c.mdnsHost || 'sms'), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
-        HB_CHECKED: checked(c.hbEnabled), HB_HOUR: String(c.hbHour == null ? 9 : c.hbHour), TZ_OPTIONS: buildTzOptions(c.tzOffsetMin),
+        HB_CHECKED: checked(c.hbEnabled), HB_HOUR: String(c.hbHour == null ? 9 : c.hbHour), TZ_OPTIONS: function(){ return buildTzOptions(c.tzOffsetMin); },
         SMS_HEALTH_CHECKED: checked(c.smsHealthEnabled), SMS_HEALTH_HOUR: String(c.smsHealthHour == null ? 10 : c.smsHealthHour), SMS_HEALTH_NOTIFY_CHECKED: checked(c.smsHealthNotify !== false),
         DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
         APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
-        OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),
-        WIFI_NETWORKS: buildWifiNetworks(c.wifiNetworks), WIFI_TX_POWER_OPTIONS: buildWifiTxPowerOptions(c.wifiTxPowerQuarterDbm), SIM_CREDENTIALS: buildSimCredentials(c.simCredentials),
+        OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: function(){ return buildPushChannels(c.pushChannels); },
+        WIFI_NETWORKS: function(){ return buildWifiNetworks(c.wifiNetworks); }, WIFI_TX_POWER_OPTIONS: function(){ return buildWifiTxPowerOptions(c.wifiTxPowerQuarterDbm); }, SIM_CREDENTIALS: function(){ return buildSimCredentials(c.simCredentials); },
         NETLED_CHECKED: checked(c.netLedEnabled !== false), CALLNOTIFY_CHECKED: checked(c.callNotifyEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
       };
-      return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){ return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m; });
+      return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){
+        if (!Object.prototype.hasOwnProperty.call(map, k)) return m;
+        return typeof map[k] === 'function' ? map[k]() : map[k];
+      });
     }
     function clearPanelTimers() {
       if (pingPollTimer) { clearTimeout(pingPollTimer); pingPollTimer = null; }
@@ -200,6 +214,8 @@
     function cleanupPanelRuntime() {
       stopLogPoll();
       stopStatusPoll();
+      cancelModemSampleClientState();
+      cancelRuleTestRequest();
       if (statusAbort) { try { statusAbort.abort(); } catch (e) {} statusAbort = null; }
       clearPanelTimers();
       stBuilt = false;
@@ -264,7 +280,7 @@
       panelFetchCtrl = ctrl;
       ensureConfig(false).then(function() {
         if (stale()) return null;
-        var opt = { cache: 'no-store' };
+        var opt = { cache: 'default' };
         if (ctrl) opt.signal = ctrl.signal;
         return fetch('/ui?panel=' + encodeURIComponent(name) + '&v=' + encodeURIComponent(WEB_ASSET_HASH), opt).then(function(r){
           if (!r.ok) throw new Error('panel ' + r.status);
@@ -997,11 +1013,6 @@
       });
     }
     // ---- Keep-Alive (保号) ----
-    function normalizeKaUrlForDisplay(url) {
-      url = url || '';
-      if (url.indexOf('gg.incrafttime.top/api/payload') >= 0) url = url.replace('size=128684', 'size=64342');
-      return url;
-    }
     function kaLoadStatus() {
       fetch('/keepalive?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
         var el = document.getElementById('kaEnabled'); if (el) el.checked = !!d.enabled;
@@ -1009,7 +1020,7 @@
         el = document.getElementById('kaAction'); if (el) el.value = d.action;
         el = document.getElementById('kaTarget'); if (el) el.value = d.target || '';
         profInit('kaProfile', d.profile || '');
-        var kaUrl = normalizeKaUrlForDisplay(d.url);
+        var kaUrl = d.url || '';
         el = document.getElementById('kaUrl'); if (el) el.value = kaUrl;
         el = document.getElementById('pingUrl'); if (el) el.value = kaUrl;
         kaSyncHead();
@@ -1389,6 +1400,45 @@
       fill.className = 'fill ' + (raw >= okAt ? 'ok' : raw >= warnAt ? 'warn' : 'bad');
     }
     var statusTimer = null, statusPolling = false, statusSeq = 0, statusAbort = null, statusLoading = false, statusFailCount = 0, devEpochBase = 0, devEpochBaseMs = 0, latestStatusKey = '', statusFastUntil = 0, modemSampleUntil = 0;
+    var modemSampleAwaitingResponse = false, modemSampleClientGeneration = 0, modemSampleRetryTimer = null;
+    function cancelModemSampleClientState() {
+      modemSampleClientGeneration++;
+      modemSampleAwaitingResponse = false;
+      modemSampleUntil = 0;
+      if (modemSampleRetryTimer) { clearTimeout(modemSampleRetryTimer); modemSampleRetryTimer = null; }
+    }
+    function modemSampleRequestFailed(generation) {
+      if (generation !== modemSampleClientGeneration) return;
+      modemSampleAwaitingResponse = false;
+      if (modemSampleRetryTimer) { clearTimeout(modemSampleRetryTimer); modemSampleRetryTimer = null; }
+      var btn = document.getElementById('modemRefreshButton');
+      if (btn) { btn.disabled = false; btn.textContent = '重试刷新'; }
+      ovSet('modemSampleResult', '刷新请求未确认，请重试或等待状态恢复');
+    }
+    function renderModemSampleState(d) {
+      if (modemSampleAwaitingResponse) return;
+      var requested = Number(d.modemSampleRequested || 0);
+      var pending = requested !== Number(d.modemSampleCompleted || 0);
+      var running = !!d.modemSampleRunning;
+      var btn = document.getElementById('modemRefreshButton');
+      if (btn) {
+        btn.disabled = pending || running;
+        btn.textContent = running ? '采样中...' : (pending ? '等待 AT 通道...' : '刷新模组信息');
+      }
+      var message = '';
+      if (pending || running) {
+        message = running ? '正在读取模组信息' : '刷新已排队，等待 AT 通道就绪且空闲';
+        modemSampleUntil = Date.now() + 15000;
+        statusFastUntil = Date.now() + 15000;
+      } else if (requested) {
+        modemSampleUntil = 0;
+        var missing = [];
+        if (!d.iccid) missing.push('ICCID');
+        if (!d.operator) missing.push('运营商');
+        message = missing.length ? '采样已完成，' + missing.join('、') + '仍未读到；请查看日志中的查询结果，后台会继续重试' : '模组信息刷新完成';
+      }
+      ovSet('modemSampleResult', message);
+    }
     function deviceEpochNow() {
       if (!devEpochBase) return 0;
       return devEpochBase + Math.floor((Date.now() - devEpochBaseMs) / 1000);
@@ -1397,11 +1447,21 @@
       var ep = deviceEpochNow();
       if (ep) ovSet('ovRefresh', '设备 ' + fmtClockEpoch(ep));
     }
-    function loadStatus(sample) {
+    function loadStatus(sample, sampleGeneration) {
+      if (sample && sampleGeneration !== modemSampleClientGeneration) return;
       if (statusLoading) {
-        if (sample) setTimeout(function(){ loadStatus(true); }, 300);
+        if (sample) {
+          if (modemSampleRetryTimer) clearTimeout(modemSampleRetryTimer);
+          modemSampleRetryTimer = setTimeout(function(){
+            modemSampleRetryTimer = null;
+            if (panelActive('overview') && sampleGeneration === modemSampleClientGeneration) {
+              loadStatus(true, sampleGeneration);
+            }
+          }, 300);
+        }
         return;  // 上一次 /status 还没回来时不叠加请求，避免 ESP32 被轮询拖慢
       }
+      if (sample && modemSampleRetryTimer) { clearTimeout(modemSampleRetryTimer); modemSampleRetryTimer = null; }
       statusLoading = true;
       var seq = ++statusSeq, timedOut = false, finished = false;
       var ctrl = window.AbortController ? new AbortController() : null;
@@ -1411,6 +1471,7 @@
       var timeoutId = setTimeout(function() {
         if (finished || seq !== statusSeq) return;
         timedOut = true;
+        if (sample) modemSampleRequestFailed(sampleGeneration);
         if (ctrl) ctrl.abort();
         else {
           // 无 AbortController 时不能真中断：同步放开 statusLoading 闸门，
@@ -1423,7 +1484,10 @@
       var url = '/status?' + (sample ? 'sample=1&' : '') + '_=' + Date.now();
       fetch(url, opt).then(jsonOrThrow).then(function(d) {
         if (seq !== statusSeq || timedOut) return;  // 旧响应直接丢弃，只显示最新状态
+        if (sample && sampleGeneration !== modemSampleClientGeneration) return;
         statusFailCount = 0;
+        if (sample) modemSampleAwaitingResponse = false;
+        renderModemSampleState(d);
         if (typeof d.tz === 'number') devTz = d.tz;
         if (typeof d.nowEpoch === 'number' && d.nowEpoch > 100000) {
           devEpochBase = d.nowEpoch;
@@ -1489,6 +1553,7 @@
         }
       }).catch(function() {
         if (seq !== statusSeq) return;
+        if (sample) modemSampleRequestFailed(sampleGeneration);
         statusFailCount++;
         if (timedOut) { ovSet('ovRefresh', '刷新超时'); return; }
         ovSet('ovRefresh', '刷新失败');
@@ -1524,18 +1589,16 @@
     }
     function stopStatusPoll() { statusPolling = false; if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; } }
     function refreshModemInfo(btn) {
-      var old = btn ? btn.textContent : '';
-      if (btn) { btn.disabled = true; btn.textContent = '采样中...'; }
-      ovSet('ovRefresh', '正在采样...');
+      var generation = ++modemSampleClientGeneration;
+      modemSampleAwaitingResponse = true;
+      if (btn) { btn.disabled = true; btn.textContent = '提交刷新...'; }
+      ovSet('modemSampleResult', '正在提交刷新请求');
       modemSampleUntil = Date.now() + 15000;
       statusFastUntil = Date.now() + 15000;
-      loadStatus(true);
+      loadStatus(true, generation);
       [700, 1500, 2500, 4000].forEach(function(delay) {
         setTimeout(function() { if (panelActive('overview')) loadStatus(); }, delay);
       });
-      setTimeout(function() {
-        if (btn) { btn.disabled = false; btn.textContent = old || '刷新模组信息'; }
-      }, 3000);
     }
 
     // ---- SIM / 网络 ----
@@ -2246,9 +2309,7 @@
         box.appendChild(d);
       });
     }
-    // ---- 规则本地测试：镜像固件 eval_forward_rules + 派发门控（自上而下首条命中即止）----
-    // 浏览器用 JS 正则预览，与设备端 POSIX ERE 在个别语法上可能有差异
-    // 按固件派发逻辑折算实际会发出的目标：推送总开关、通道启用、邮件启用+配置齐全
+    // ---- 规则测试：匹配交给固件真实规则引擎，前端只折算当前可投递目标 ----
     function deliverTargets(useEmail, chanMask) {
       var c = webConfig || {}, arr = c.pushChannels || [];
       var out = [], skipped = [];
@@ -2265,40 +2326,53 @@
       }
       return { out: out, skipped: skipped };
     }
+    function cancelRuleTestRequest() {
+      ruleTestSeq++;
+      if (ruleTestAbort) { try { ruleTestAbort.abort(); } catch (e) {} ruleTestAbort = null; }
+    }
     function testRules() {
+      cancelRuleTestRequest();
+      var seq = ruleTestSeq;
       serializeRules();
       var from = (document.getElementById('rtFrom').value || '').trim();
       var text = document.getElementById('rtText').value || '';
       var r = document.getElementById('rtResult');
       if (!text && !from) { r.className = 'result-box result-error'; r.textContent = '请先填写测试发件人或正文'; return; }
-      for (var i = 0; i < fwdRules.length; i++) {
-        var rule = fwdRules[i];
-        if (!rule.enabled || !rule.pattern) continue;
-        var hit = false;
-        if (rule.type === 'kw') {
-          hit = text.indexOf(rule.pattern) >= 0;
-        } else {
-          try { hit = new RegExp(rule.pattern, 'i').test(rule.type === 'from' ? from : text); }
-          catch (e) { r.className = 'result-box result-error'; r.textContent = '规则 ' + (i + 1) + ' 的正则浏览器无法解析，请检查语法：' + e.message; return; }
-        }
-        if (!hit) continue;
-        if (rule.drop) {
+      r.className = 'result-box result-loading'; r.textContent = '按设备实际规则测试中...';
+      var raw = (document.getElementById('forwardRulesRaw') || {}).value || '';
+      var body = new URLSearchParams();
+      body.append('rules', raw); body.append('sender', from); body.append('text', text);
+      var ctrl = window.AbortController ? new AbortController() : null;
+      ruleTestAbort = ctrl;
+      var opt = {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body};
+      if (ctrl) opt.signal = ctrl.signal;
+      csrfFetch('/testrule', opt).then(jsonMessageOrThrow).then(function(result) {
+        if (seq !== ruleTestSeq) return;
+        var index = result.ruleIndex || 0;
+        if (result.matched && result.drop) {
           r.className = 'result-box result-error';
-          r.textContent = '命中规则 ' + (i + 1) + ' → 丢弃(不转发)';
+          r.textContent = '命中规则 ' + index + ' → 丢弃(不转发)';
           return;
         }
-        var d = deliverTargets(rule.email, rule.chans);
-        var msg = '命中规则 ' + (i + 1) + ' → ' + (d.out.length ? '实际转发到：' + d.out.join('、') : '没有可用转发目标(该短信不会被转发)');
+        var selected = {};
+        if (result.matched) {
+          for (var c = 1; c <= 5; c++) selected[c] = !!(result.chMask & (1 << (c - 1)));
+        } else {
+          for (var n = 1; n <= 5; n++) selected[n] = true;
+        }
+        var d = deliverTargets(result.matched ? !!result.email : true, selected);
+        var prefix = result.matched ? ('命中规则 ' + index + ' → ') : '未命中任何规则 → ';
+        var msg = prefix + (d.out.length ? (result.matched ? '实际转发到：' : '按默认策略实际转发到：') + d.out.join('、') : '没有可用转发目标(该短信不会被转发)');
         if (d.skipped.length) msg += '；跳过：' + d.skipped.join('、');
-        r.className = 'result-box ' + (d.out.length ? 'result-success' : 'result-error');
+        r.className = 'result-box ' + (d.out.length ? (result.matched ? 'result-success' : 'result-info') : 'result-error');
         r.textContent = msg;
-        return;
-      }
-      // 未命中：固件默认转发到全部启用通道 + 邮件(各自仍受开关/配置门控)
-      var all = {}; for (var n = 1; n <= 5; n++) all[n] = true;
-      var dd = deliverTargets(true, all);
-      r.className = 'result-box ' + (dd.out.length ? 'result-info' : 'result-error');
-      r.textContent = '未命中任何规则 → ' + (dd.out.length ? '按默认策略实际转发到：' + dd.out.join('、') : '没有可用转发目标(该短信不会被转发)');
+      }).catch(function(e) {
+        if (seq !== ruleTestSeq || (e && e.name === 'AbortError')) return;
+        r.className = 'result-box result-error';
+        r.textContent = '规则测试失败：' + (e && e.message ? e.message : '设备未返回有效结果');
+      }).then(function() {
+        if (seq === ruleTestSeq && ruleTestAbort === ctrl) ruleTestAbort = null;
+      });
     }
 
     // ---- 短信详情抽屉(点击展开) ----

@@ -33,6 +33,9 @@ struct IdfModemStatus {
     std::string simState = "unknown";
     bool simCredentialMatched = false;
     std::string simUnlockMessage;
+    uint32_t sampleRequested = 0;
+    uint32_t sampleCompleted = 0;
+    bool sampleRunning = false;
 };
 
 struct IdfCellularHttpResult {
@@ -53,7 +56,8 @@ struct IdfCellularHttpConfig {
 esp_err_t idf_modem_start(const IdfConfig& config);
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
-esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
+esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms,
+                             std::string& response, void (*on_submit)() = nullptr);
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
 esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* method,
                                            const char* content_type, const std::string& body,
@@ -72,6 +76,8 @@ void idf_modem_signal_event(void);
 IdfModemStatus idf_modem_get_status(void);
 // 获取合法数字 IMEI；优先使用缓存，缓存缺失时通过模组标准 IMEI 命令补采。
 esp_err_t idf_modem_get_imei(std::string& imei);
+// 原子查询当前驻网运营商；名称不可用时返回显式 PLMN，恢复原查询格式后才报告成功。
+esp_err_t idf_modem_get_operator(std::string& name);
 // AT 通道当前是否空闲（Web 路由用于"模组正忙"快速返回，避免长时间阻塞 httpd 任务）
 bool idf_modem_at_idle(void);
 // 用户显式请求刷新概览模组信息时，短时间打开展示型身份/信号采样窗口。

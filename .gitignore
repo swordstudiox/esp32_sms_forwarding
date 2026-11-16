@@ -16,3 +16,4 @@ preview/index.html
 dist/
 tasks/
 tests/
+/.codex-tmp/

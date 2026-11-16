@@ -340,7 +340,6 @@ std::string idf_log_json_since(uint32_t since)
 {
     ensure_init();
     std::string out;
-    out.reserve(2048);
 
     if (!s_log_mutex || xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
         // 返回最近已知序号而非 0：seq 回退会被网页误判为设备重启，清屏重放
@@ -358,13 +357,17 @@ std::string idf_log_json_since(uint32_t since)
     // 否则网页要等新日志追上旧游标才恢复显示
     if (since > seq) since = 0;
 
+    // 从增量游标直接定位新日志；空轮询不再申请 2 KB 缓冲或遍历整个环形队列。
+    size_t first_pending = since >= oldest ? static_cast<size_t>(since - oldest) + 1 : 0;
+    if (first_pending > count) first_pending = count;
+    const size_t pending = count - first_pending;
+    out.reserve(pending ? 2048 : 48);
+
     char head[48];
     snprintf(head, sizeof(head), "{\"seq\":%" PRIu32 ",\"lines\":[", seq);
     out += head;
     bool first = true;
-    for (size_t i = 0; i < count; ++i) {
-        uint32_t line_seq = oldest + static_cast<uint32_t>(i);
-        if (line_seq <= since) continue;
+    for (size_t i = first_pending; i < count; ++i) {
         if (!first) out += ",";
         first = false;
         out += "\"";

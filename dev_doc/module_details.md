@@ -14,7 +14,7 @@
 
 ## components/idf_modem
 
-负责 UART1、AT 命令互斥、模组上电/硬重启/软重启、网络注册、信号与身份采样、PDP/MHTTP、USSD、网页发短信底层发送。其它模块不得直接访问 UART。
+负责 UART1、AT 命令互斥、模组上电/硬重启/软重启、网络注册、信号与身份采样、PDP/MHTTP、USSD、网页发短信底层发送。其它模块不得直接访问 UART。网页手动刷新使用请求/完成代次追踪，不因 AT 通道繁忙丢请求；ICCID 统一规范化并保留合法 A-F 字符，运营商名称缺失时回退显示 serving PLMN。
 
 ## components/idf_sms
 
@@ -22,11 +22,11 @@
 
 ## components/idf_push
 
-负责转发规则、推送队列、邮件队列、失败重试、通道冷却、测试推送和 10 类推送渠道。慢速 HTTP/HTTPS/SMTP 只在 worker 中执行。
+负责转发规则、推送队列、邮件队列、失败重试、通道冷却、测试推送和 10 类推送渠道。慢速 HTTP/HTTPS/SMTP 只在 worker 中执行。worker 未启动时所有入队接口拒绝接收孤儿任务，Web scheduler 按分钟尝试恢复 worker。
 
 ## components/idf_web
 
-负责 `esp_http_server` 路由、Basic Auth、静态 Web UI、状态 JSON、配置保存、日志、收件箱 API、OTA、诊断、AT 终端、保号任务和 scheduler。
+负责 `esp_http_server` 路由、Basic Auth、静态 Web UI、状态 JSON、配置保存、日志、收件箱 API、OTA、诊断、AT 终端、保号任务和 scheduler。自定义定时任务采用 at-most-once 执行语义：在切卡、短信、USSD 或蜂窝 HTTP 等外部动作前，按任务身份原子校验并持久化执行进度；并发保存保留锁内最新进度，任务已变化或进度写入失败则取消旧动作，动作失败仍按既有策略退避到次日重试。每日心跳同样只持久化一次当日 claim 再入队，队列暂满时仅在 RAM 中重试；无有效通知目标时本日停止重试，避免反复写日志。转发规则测试复用 `idf_push` 的实际规则引擎，并用请求 generation 隔离乱序响应。
 
 ## components/idf_logbuf / idf_inbox
 

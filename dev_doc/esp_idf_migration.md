@@ -8,8 +8,11 @@
 - Web UI 源文件：`code/web_src/`。
 - 生成的 gzip Web 资源：`code/web_assets.h`、`code/web_assets.cpp`，由 `components/web_assets` 作为 IDF component 链接。
 - 构建输出：只写入 `build/`。
-- 本机推荐入口：`powershell -ExecutionPolicy Bypass -File tools\idf.ps1 build`。
+- 本机验证基线：ESP-IDF 5.5.4；CI 另用 ESP-IDF 6.0.2 做兼容性检查。
+- 本机推荐入口：`powershell -ExecutionPolicy Bypass -File tools\idf.ps1 build`；脚本默认加载 `E:\Espressif\esp-idf-v5.5.4`，并把 ccache 放在仓库 `build/` 内。
 - 烧录入口：`powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5`。
+- `build/idf6` 和 `build/sdkconfig.idf6` 是历史兼容路径名，不表示本机安装了 ESP-IDF 6。
+- SDK 补丁统一由 `tools/apply_idf_patches.py` 严格预检；`patches/esp-idf/` 下的交叉签名证书内存补丁仅在 IDF 6 对应功能存在时应用，本机 IDF 5.5.4 正常跳过。
 
 ## 当前实现
 

@@ -76,6 +76,8 @@ Web UI 提供独立的定时任务页，既能做 SIM 保号，也能做系统�
 - 每日心跳：定时发送状态通知，确认设备还在线。
 - 每日重启：指定小时自动重启，适合无人值守场景做周期性自恢复。
 - 自定义定时任务：最多可配置 6 个任务卡片，每个任务可设置名称、间隔天数、目标 Profile、是否切回、动作和 payload。
+- 自定义任务会在切卡、发短信或跑流量前按任务身份原子校验并持久化本次执行时间；并发保存不会回滚运行进度，任务已变化或进度写入失败时取消旧动作，避免下一轮重复执行和重复扣费。
+- 每日心跳在到点后按 at-most-once 语义只持久化一次当日 claim 再入队；队列暂满时仅在 RAM 中按分钟补投，不反复写 NVS；未配置有效通知目标时当天停止重试，避免重复日志覆盖诊断信息。
 - 任务保存是局部保存，保号、系统定时、自定义任务互不影响。
 
 ### eSIM 管理
@@ -107,10 +109,13 @@ Web UI 提供独立的定时任务页，既能做 SIM 保号，也能做系统�
 
 ### 原生 ESP-IDF 固件
 
-- 基于 ESP-IDF 6.0.2，目标芯片为 ESP32-C3。
+- 本地与实机以 ESP-IDF 5.5.4 为验证基线，同时保留 ESP-IDF 6.0.2 兼容构建，目标芯片为 ESP32-C3。
 - 使用组件化结构拆分配置、WiFi、Web、模组、短信、推送、日志和收件箱。
 - 通过 CI 持续构建，减少“本地能编过、换环境不行”的问题。
 - Web UI 使用 `code/web_src/` 维护源码，再打包为 gzip 静态资源链接进固件。
+- “刷新模组信息”使用请求代次确认排队、执行与完成状态；ICCID 支持运营商使用的十六进制字符，运营商名称为空时显示当前 PLMN。
+- 转发规则测试由设备端真实规则引擎执行，避免浏览器正则与固件 POSIX 正则语义不一致。
+- 推送后台 worker 启动失败时不会接受无人消费的孤儿任务；Web scheduler 会按分钟尝试恢复 worker。
 
 ### 稳定的短信接收链路
 
@@ -299,7 +304,7 @@ esptool --chip esp32c3 -p COM5 -b 460800 --before default-reset --after hard-res
 - ESP32-C3 开发板或 ESP32-C3 Super Mini。
 - ML307 系列 4G/LTE 模组。
 - USB 数据线和对应串口驱动。
-- ESP-IDF 6.0.2。仓库脚本默认查找 `E:\Espressif\esp-idf-v6.0.2`，也可以通过 `IDF_PATH` 和 `IDF_TOOLS_PATH` 环境变量指定自己的安装位置。
+- ESP-IDF 5.5.4。仓库脚本默认查找 `E:\Espressif\esp-idf-v5.5.4`，也可以通过 `-IdfPath` / `-IdfToolsPath` 参数或同名环境变量指定自己的安装位置。CI 另用 ESP-IDF 6.0.2 检查兼容性，本机不要求安装 6.0.2。
 
 确认串口号：
 
@@ -314,7 +319,7 @@ git clone https://github.com/swordstudiox/esp32_sms_forwarding.git
 cd esp32_sms_forwarding
 ```
 
-仓库提供了 ESP-IDF 封装脚本，会自动加载 ESP-IDF 环境，并把构建产物放在 `build/idf6`，把配置放在 `build/sdkconfig.idf6`：
+仓库提供了 ESP-IDF 封装脚本，会自动加载 ESP-IDF 环境、把 ccache 限定在仓库 `build/` 内，并把构建产物放在 `build/idf6`，把配置放在 `build/sdkconfig.idf6`。`idf6` 是兼容既有脚本保留的目录名，不代表本机使用 IDF 6：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 build
@@ -341,7 +346,7 @@ powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 
 `monitor` 中可以看到 WiFi 连接、模组初始化、短信接收、推送、Web 访问和崩溃原因等日志。退出 monitor 通常使用 `Ctrl+]`。
 
-CI 使用固定的 ESP-IDF 6.0.2 环境，通过 `.github/workflows/build.yml` 构建固件；日常本地开发建议仍使用 `tools\idf.ps1`，这样 SDK 版本、构建目录和配置文件位置保持一致。
+日常本地开发与实机验证使用 ESP-IDF 5.5.4 和 `tools\idf.ps1`；CI 使用固定的 ESP-IDF 6.0.2 环境作为额外兼容性检查。构建前 `tools/apply_idf_patches.py` 会严格预检补丁：通用 Mbed TLS 证书策略补丁用于两条路径，IDF 6 交叉签名证书内存修复只在 SDK 提供对应功能时应用，IDF 5.x 会明确跳过。详见 `patches/README.md`。
 
 ## Bark 推送
 

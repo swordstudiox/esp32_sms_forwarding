@@ -140,13 +140,6 @@ struct SmtpTestJob {
     IdfEmailSettingsView cfg;
 };
 
-struct ForwardDecision {
-    bool matched = false;
-    bool drop = false;
-    uint32_t chMask = 0;
-    bool email = false;
-};
-
 static SemaphoreHandle_t s_mutex = nullptr;
 // worker 唤醒信号：新任务入队即刻开始处理，不等 100ms 空闲轮询
 static SemaphoreHandle_t s_wake_sem = nullptr;
@@ -156,7 +149,7 @@ static std::array<EmailJob, EMAIL_QUEUE_MAX> s_email_jobs;
 static std::array<TestJob, IDF_MAX_PUSH_CHANNELS> s_test_jobs;
 static SmtpTestJob s_smtp_test_job;
 static std::array<ForwardCompletion, PUSH_QUEUE_MAX + EMAIL_QUEUE_MAX> s_forward_completions;
-static bool s_started = false;
+static std::atomic<bool> s_started{false};
 static uint32_t s_next_completion_id = 0;
 static std::atomic<bool> s_busy{false};
 // 通道连续失败冷却状态（仅推送 worker 单任务读写，无需加锁）
@@ -663,10 +656,13 @@ static bool regex_search_case_insensitive(const std::string& pattern, const std:
     return hit;
 }
 
-static ForwardDecision eval_forward_rules(const std::string& rules, const std::string& sender, const std::string& body)
+IdfForwardRuleDecision idf_push_eval_forward_rules(const std::string& rules,
+                                                   const std::string& sender,
+                                                   const std::string& body)
 {
-    ForwardDecision d;
+    IdfForwardRuleDecision d;
     size_t pos = 0;
+    int rule_index = 0;
     while (pos < rules.size()) {
         size_t end = rules.find('\n', pos);
         if (end == std::string::npos) end = rules.size();
@@ -677,6 +673,7 @@ static ForwardDecision eval_forward_rules(const std::string& rules, const std::s
         size_t t1 = line.find('\t');
         size_t t2 = t1 == std::string::npos ? std::string::npos : line.find('\t', t1 + 1);
         if (t1 == std::string::npos || t2 == std::string::npos) continue;
+        ++rule_index;
         size_t t3 = line.find('\t', t2 + 1);
         std::string type = line.substr(0, t1);
         std::string pat = line.substr(t1 + 1, t2 - t1 - 1);
@@ -691,6 +688,7 @@ static ForwardDecision eval_forward_rules(const std::string& rules, const std::s
         if (!hit) continue;
 
         d.matched = true;
+        d.ruleIndex = rule_index;
         size_t ap = 0;
         while (ap <= action.size()) {
             size_t comma = action.find(',', ap);
@@ -1587,7 +1585,7 @@ static bool process_forward_one()
     }
 
     const IdfPushForwardView cfg = idf_config_get_push_forward_view();
-    ForwardDecision fd = eval_forward_rules(cfg.forwardRules, job.sender, job.text);
+    IdfForwardRuleDecision fd = idf_push_eval_forward_rules(cfg.forwardRules, job.sender, job.text);
     if (fd.matched && fd.drop) {
         idf_logf("转发规则命中：丢弃短信 id=%u", static_cast<unsigned>(job.inboxId));
         idf_inbox_mark_forwarded(job.inboxId);
@@ -1974,7 +1972,7 @@ static void push_task(void*)
 
 esp_err_t idf_push_start(void)
 {
-    if (s_started) return ESP_OK;
+    if (s_started.load(std::memory_order_acquire)) return ESP_OK;
     if (!ensure_init()) {
         cleanup_start_resources();
         return ESP_ERR_NO_MEM;
@@ -1984,13 +1982,19 @@ esp_err_t idf_push_start(void)
         cleanup_start_resources();
         return ESP_ERR_NO_MEM;
     }
-    s_started = true;
+    s_started.store(true, std::memory_order_release);
     idf_log_line("推送后台 worker 已启动");
     return ESP_OK;
 }
 
+bool idf_push_ready(void)
+{
+    return s_started.load(std::memory_order_acquire);
+}
+
 bool idf_push_enqueue_forward(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id)
 {
+    if (!idf_push_ready()) return false;
     if (!ensure_init()) return false;
     // 临界区都很短(纯内存操作)，无限等锁保证收到的短信绝不因锁竞争被丢
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
@@ -2001,15 +2005,25 @@ bool idf_push_enqueue_forward(const char* sender, const char* text, const char* 
     return ok;
 }
 
-int idf_push_enqueue_notify(const char* title, const char* body, const char* timestamp)
+int idf_push_enqueue_notify(const char* title, const char* body, const char* timestamp,
+                            int* available_targets)
 {
-    if (!ensure_init()) return 0;
+    if (available_targets) *available_targets = 0;
     const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
     if (!cfg.pushEnabled) return 0;
 
     std::string ts = timestamp ? timestamp : "";
     if (ts.empty()) ts = format_local_time(cfg.tzOffsetMin);
     if (ts.empty()) ts = "时间未同步";
+
+    int eligible = 0;
+    for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+        if (channel_valid(cfg.pushChannels[i])) ++eligible;
+    }
+    if (available_targets) *available_targets = eligible;
+    if (eligible == 0) return 0;
+    if (!idf_push_ready()) return 0;
+    if (!ensure_init()) return 0;
 
     int dispatched = 0;
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return 0;
@@ -2026,6 +2040,7 @@ int idf_push_enqueue_notify(const char* title, const char* body, const char* tim
 
 bool idf_push_enqueue_email(const char* subject, const char* body)
 {
+    if (!idf_push_ready()) return false;
     if (!ensure_init()) return false;
     if (!idf_config_email_configured()) {
         idf_log_line("邮件配置不完整，邮件未入队");
@@ -2044,6 +2059,7 @@ bool idf_push_enqueue_email(const char* subject, const char* body)
 
 int idf_push_forward_queue_depth(void)
 {
+    if (!idf_push_ready()) return 0;
     if (!ensure_init()) return 0;
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return 0;
     int n = 0;
@@ -2054,6 +2070,7 @@ int idf_push_forward_queue_depth(void)
 
 int idf_push_retry_queue_depth(void)
 {
+    if (!idf_push_ready()) return 0;
     if (!ensure_init()) return 0;
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return 0;
     int n = queue_depth_locked(s_push_jobs);
@@ -2063,6 +2080,7 @@ int idf_push_retry_queue_depth(void)
 
 int idf_push_email_queue_depth(void)
 {
+    if (!idf_push_ready()) return 0;
     if (!ensure_init()) return 0;
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return 0;
     int n = email_queue_depth_locked();
@@ -2072,7 +2090,7 @@ int idf_push_email_queue_depth(void)
 
 bool idf_push_busy(void)
 {
-    return s_busy.load(std::memory_order_relaxed);
+    return idf_push_ready() && s_busy.load(std::memory_order_relaxed);
 }
 
 bool idf_push_enqueue_test(uint8_t channel, std::string& message)
@@ -2083,6 +2101,10 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
     }
     if (!http_transport_available()) {
         message = "WiFi 未连接且蜂窝数据不可用，暂不能测试推送";
+        return false;
+    }
+    if (!idf_push_ready()) {
+        message = "推送后台 worker 未启动，正在等待恢复";
         return false;
     }
     if (!ensure_init()) {
@@ -2123,6 +2145,9 @@ std::string idf_push_test_status_json(uint8_t channel)
     if (channel >= IDF_MAX_PUSH_CHANNELS) {
         return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"通道序号无效\"}";
     }
+    if (!idf_push_ready()) {
+        return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"推送后台 worker 未启动\"}";
+    }
     if (!ensure_init()) {
         return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"推送队列初始化失败\"}";
     }
@@ -2157,6 +2182,10 @@ bool idf_push_enqueue_smtp_test(const IdfEmailSettingsView& cfg, std::string& me
         message = "SMTP 端口无效";
         return false;
     }
+    if (!idf_push_ready()) {
+        message = "推送后台 worker 未启动，正在等待恢复";
+        return false;
+    }
     if (!ensure_init()) {
         message = "邮件测试队列初始化失败";
         return false;
@@ -2188,6 +2217,9 @@ bool idf_push_enqueue_smtp_test(const IdfEmailSettingsView& cfg, std::string& me
 
 std::string idf_push_smtp_test_status_json(void)
 {
+    if (!idf_push_ready()) {
+        return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"推送后台 worker 未启动\"}";
+    }
     if (!ensure_init()) {
         return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"邮件测试队列初始化失败\"}";
     }
